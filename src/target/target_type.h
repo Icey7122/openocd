@@ -356,6 +356,7 @@ extern struct target_type ls1_sap_target;
 extern struct target_type mem_ap_target;
 extern struct target_type mips_m4k_target;
 extern struct target_type mips_mips64_target;
+extern struct target_type loongarch_target;
 extern struct target_type or1k_target;
 extern struct target_type quark_d20xx_target;
 extern struct target_type quark_x10xx_target;

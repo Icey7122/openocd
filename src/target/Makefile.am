@@ -19,6 +19,7 @@ noinst_LTLIBRARIES += %D%/libtarget.la
 	$(ARM_MISC_SRC) \
 	$(AVR32_SRC) \
 	$(MIPS32_SRC) \
+	$(LOONGARCH_SRC) \
 	$(STM8_SRC) \
 	$(INTEL_IA32_SRC) \
 	$(ESIRISC_SRC) \
@@ -125,6 +126,11 @@ MIPS32_SRC = \
 	%D%/mips32_pracc.c \
 	%D%/mips32_dmaacc.c \
 	%D%/mips_ejtag.c
+
+LOONGARCH_SRC = \
+	%D%/loongarch.c \
+	%D%/loongarch_ejtag.c \
+	%D%/loongarch_pracc.c
 
 MIPS64_SRC = \
 	%D%/mips64.c \
