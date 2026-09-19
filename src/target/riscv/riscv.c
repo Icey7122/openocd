@@ -3868,7 +3868,7 @@ static int riscv_poll_hart(struct target *target, enum riscv_next_action *next_a
 {
 	RISCV_INFO(r);
 
-	LOG_TARGET_DEBUG(target, "polling, target->state=%d", target->state);
+	LOG_TARGET_DEBUG_IO(target, "polling, target->state=%d", target->state);
 
 	*next_action = RPH_NONE;
 
@@ -4045,7 +4045,7 @@ exit:
 /*** OpenOCD Interface ***/
 int riscv_openocd_poll(struct target *target)
 {
-	LOG_TARGET_DEBUG(target, "Polling all harts.");
+	LOG_TARGET_DEBUG_IO(target, "Polling all harts.");
 
 	struct riscv_info *i = riscv_info(target);
 
@@ -4104,7 +4104,7 @@ int riscv_openocd_poll(struct target *target)
 		}
 	}
 
-	LOG_TARGET_DEBUG(target, "should_remain_halted=%d, should_resume=%d",
+	LOG_TARGET_DEBUG_IO(target, "should_remain_halted=%d, should_resume=%d",
 				should_remain_halted, should_resume);
 	if (should_remain_halted && should_resume) {
 		LOG_TARGET_WARNING(target, "%d harts should remain halted, and %d should resume.",

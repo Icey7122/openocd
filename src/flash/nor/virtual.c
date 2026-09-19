@@ -175,8 +175,11 @@ static int virtual_blank_check(struct flash_bank *bank)
 	if (!master_bank)
 		return ERROR_FLASH_OPERATION_FAILED;
 
-	/* call master handler */
-	return master_bank->driver->erase_check(master_bank);
+	/* call master handler or default */
+	if (master_bank->driver->erase_check)
+		return master_bank->driver->erase_check(master_bank);
+
+	return default_flash_blank_check(master_bank);
 }
 
 static int virtual_flash_read(struct flash_bank *bank,
@@ -187,8 +190,11 @@ static int virtual_flash_read(struct flash_bank *bank,
 	if (!master_bank)
 		return ERROR_FLASH_OPERATION_FAILED;
 
-	/* call master handler */
-	return master_bank->driver->read(master_bank, buffer, offset, count);
+	/* call master handler or default */
+	if (master_bank->driver->read)
+		return master_bank->driver->read(master_bank, buffer, offset, count);
+
+	return default_flash_read(master_bank, buffer, offset, count);
 }
 
 void virtual_flash_free_driver_priv(struct flash_bank *bank)

@@ -778,7 +778,7 @@ int riscv_reg_flush_all(struct target *target)
 	if (!target->reg_cache)
 		return ERROR_OK;
 
-	LOG_TARGET_DEBUG(target, "Flushing register cache");
+	LOG_TARGET_DEBUG_IO(target, "Flushing register cache");
 
 	/* Writing non-GPR registers may require progbuf execution, and some GPRs
 	 * may become dirty in the process (e.g. S0, S1). For that reason, flush
@@ -795,7 +795,7 @@ int riscv_reg_flush_all(struct target *target)
 				return ERROR_FAIL;
 		}
 	}
-	LOG_TARGET_DEBUG(target, "Flush of register cache completed");
+	LOG_TARGET_DEBUG_IO(target, "Flush of register cache completed");
 	return ERROR_OK;
 }
 

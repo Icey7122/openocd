@@ -106,7 +106,10 @@ int flash_driver_read(struct flash_bank *bank,
 
 	LOG_DEBUG("call flash_driver_read()");
 
-	retval = bank->driver->read(bank, buffer, offset, count);
+	if (bank->driver->read)
+		retval = bank->driver->read(bank, buffer, offset, count);
+	else
+		retval = default_flash_read(bank, buffer, offset, count);
 	if (retval != ERROR_OK) {
 		LOG_ERROR(
 			"error reading to flash at address " TARGET_ADDR_FMT
@@ -129,8 +132,10 @@ int flash_driver_verify(struct flash_bank *bank,
 {
 	int retval;
 
-	retval = bank->driver->verify ? bank->driver->verify(bank, buffer, offset, count) :
-		default_flash_verify(bank, buffer, offset, count);
+	if (bank->driver->verify)
+		retval = bank->driver->verify(bank, buffer, offset, count);
+	else
+		retval = default_flash_verify(bank, buffer, offset, count);
 	if (retval != ERROR_OK) {
 		LOG_ERROR("verify failed in bank at " TARGET_ADDR_FMT " starting at 0x%8.8" PRIx32,
 			bank->base, offset);
@@ -221,7 +226,7 @@ void flash_free_all_banks(void)
 		if (bank->driver->free_driver_priv)
 			bank->driver->free_driver_priv(bank);
 		else
-			LOG_WARNING("Flash driver of %s does not support free_driver_priv()", bank->name);
+			default_flash_free_driver_priv(bank);
 
 		free(bank->sectors);
 		free(bank->prot_blocks);

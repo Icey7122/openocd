@@ -985,6 +985,8 @@ COMMAND_HANDLER(jlink_usb_command)
 	if (CMD_ARGC != 1)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
+	LOG_WARNING("DEPRECATED! Using the USB address is deprecated, use the serial number instead");
+
 	unsigned int tmp;
 	COMMAND_PARSE_NUMBER(uint, CMD_ARGV[0], tmp);
 
@@ -1954,16 +1956,20 @@ static int jlink_swd_init(void)
 	return ERROR_OK;
 }
 
-static void jlink_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
+static int jlink_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
 {
 	assert(!(cmd & SWD_CMD_RNW));
 	jlink_swd_queue_cmd(cmd, NULL, value, ap_delay_clk);
+
+	return ERROR_OK;	/* TODO: return error instead of queuing it */
 }
 
-static void jlink_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
+static int jlink_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
 {
 	assert(cmd & SWD_CMD_RNW);
 	jlink_swd_queue_cmd(cmd, value, 0, ap_delay_clk);
+
+	return ERROR_OK;	/* TODO: return error instead of queuing it */
 }
 
 /***************************************************************************/

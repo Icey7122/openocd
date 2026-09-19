@@ -27,15 +27,27 @@
 #define EUD_EP_OUT						0x02
 #define EUD_EP_IN						0x81
 #define EUD_USB_TIMEOUT_MS				6000
-#define EUD_SWD_MAX_QUEUED_TRANSFERS	64
+/*
+ * The SWD function exposes 32-byte hardware FIFOs in both directions.
+ * The hardware processes commands in order until any of the following:
+ * a) it encounters an undefined opcode
+ * b) cur_cmd == EUD_NOP/FLUSH, after which it ignores the rest of the buffer
+ * c) until it processes everything
+ */
+#define EUD_SWD_BUFFER_SIZE				32
+/*
+ * Every queue flush ends with a STATUS opcode; budget for a FLUSH opcode
+ * too, even though eud_swd_flush_queue() omits it when the IN FIFO ends up
+ * exactly full.
+ */
+#define EUD_SWD_QUEUE_TRAILER_SIZE		2
+#define EUD_SWD_STATUS_SIZE				4
 
 #define EUD_CTL_CMD_CTLOUT_SET			7
 #define EUD_CTL_CMD_CTLOUT_CLR			8
 
 #define EUD_CTL_RCTLR_SRST_N		BIT(0)
-#define EUD_CTL_GPIO_SRST_N			BIT(1)
 #define EUD_CTL_SWD_PERIPH_EN		BIT(2)
-#define EUD_CTL_DAP_TRST_N			BIT(3)
 #define EUD_CTL_JTAG_PERIPH_EN		BIT(4)
 #define EUD_CTL_VDDMIN_TCK_EN		BIT(6)
 #define EUD_CTL_GPIO_JTAG_SEL		BIT(7)
@@ -87,6 +99,18 @@
 #define SWD_CMD_TIMING_WAIT_35_IF_ERR	BIT(18)
 #define SWD_CMD_TIMING_RESERVED	GENMASK(31, 19)
 #define EUD_SWD_CMD_STATUS			7
+ // Reading the status clears cmd_cntr and the error flags, so every queue
+ // flush needs a status of its own
+ // The ack[2:0] the DAP returned for the last command processed
+#define SWD_CMD_STATUS_ACK		GENMASK(2, 0)
+ // Set once the SWD Peripheral has exhausted its ACK.WAIT retries
+#define SWD_CMD_STATUS_WAIT_TIMEOUT	BIT(3)
+ // Set when a DAP response does not match the parity bit it came with
+#define SWD_CMD_STATUS_PARITY_ERR	BIT(4)
+ // The number of SWD R/W commands the peripheral got through. An error flag
+ // stops it on the offending command, but an ack that is merely not OK does
+ // not, so it bounds a failure rather than pinpointing it
+#define SWD_CMD_STATUS_CMD_CNTR		GENMASK(31, 16)
 #define EUD_SWD_CMD_PERIPH_RST		8
 
 struct eud_device {
@@ -105,9 +129,14 @@ struct eud_swd_transfer {
 static libusb_context *eud_libusb_ctx;
 static struct eud_device eud_ctl;
 static struct eud_device eud_swd;
-static struct eud_swd_transfer eud_queue[EUD_SWD_MAX_QUEUED_TRANSFERS];
+/*
+ * Every transfer costs at least one OUT byte, so a queue can never hold more
+ * transfers than the FIFO is bytes wide.
+ */
+static struct eud_swd_transfer eud_queue[EUD_SWD_BUFFER_SIZE];
 static unsigned int eud_queue_len;
-static int eud_queued_retval = ERROR_OK;
+static unsigned int eud_queue_out_len;
+static unsigned int eud_queue_in_len;
 static int eud_speed_index = 0xa;
 
 static const unsigned int eud_speed_khz[] = {
@@ -424,114 +453,216 @@ static int eud_swd_init(void)
 	return eud_swd_prepare();
 }
 
-static void eud_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
+static int eud_swd_flush_queue(void);
+
+static unsigned int eud_swd_transfer_out_size(const struct eud_swd_transfer *transfer)
 {
-	assert(cmd & SWD_CMD_RNW);
+	unsigned int size = transfer->cmd & SWD_CMD_RNW ? 1 : 5;
 
-	if (eud_queue_len >= ARRAY_SIZE(eud_queue)) {
-		eud_queued_retval = ERROR_FAIL;
-		return;
-	}
+	if (transfer->ap_delay_clk)
+		size += 5;
 
-	eud_queue[eud_queue_len++] = (struct eud_swd_transfer) {
-		.cmd = cmd,
-		.read_value = value,
-		.ap_delay_clk = ap_delay_clk,
-	};
+	return size;
 }
 
-static void eud_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
+static unsigned int eud_swd_transfer_in_size(const struct eud_swd_transfer *transfer)
 {
-	assert(!(cmd & SWD_CMD_RNW));
+	return transfer->cmd & SWD_CMD_RNW ? 4 : 0;
+}
 
-	if (eud_queue_len >= ARRAY_SIZE(eud_queue)) {
-		eud_queued_retval = ERROR_FAIL;
-		return;
+static int eud_swd_queue_transfer(uint8_t cmd, uint32_t value,
+		uint32_t *read_value, uint32_t ap_delay_clk)
+{
+	if (ap_delay_clk > EUD_SWD_DITMS_MAX_BITS) {
+		LOG_ERROR("EUD SWD AP delay of %" PRIu32 " clocks is too large", ap_delay_clk);
+		return ERROR_FAIL;
 	}
 
-	eud_queue[eud_queue_len++] = (struct eud_swd_transfer) {
+	struct eud_swd_transfer transfer = {
 		.cmd = cmd,
 		.value = value,
+		.read_value = read_value,
 		.ap_delay_clk = ap_delay_clk,
 	};
+	unsigned int transfer_out = eud_swd_transfer_out_size(&transfer);
+	unsigned int transfer_in = eud_swd_transfer_in_size(&transfer);
+	bool returns_ack = swd_cmd_returns_ack(cmd);
+
+	/*
+	 * Run whatever is already queued if this transfer would not fit in
+	 * the hardware FIFOs alongside it, or if it is unacknowledged: a
+	 * DP_TARGETSEL write is answered with silence, so it must be the
+	 * only transfer in the queue, see eud_swd_flush_queue().
+	 */
+	if (eud_queue_len &&
+			(!returns_ack ||
+			 eud_queue_out_len + transfer_out + EUD_SWD_QUEUE_TRAILER_SIZE > EUD_SWD_BUFFER_SIZE ||
+			 eud_queue_in_len + transfer_in + EUD_SWD_STATUS_SIZE > EUD_SWD_BUFFER_SIZE)) {
+		int retval = eud_swd_flush_queue();
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	eud_queue[eud_queue_len++] = transfer;
+	eud_queue_out_len += transfer_out;
+	eud_queue_in_len += transfer_in;
+
+	if (!returns_ack)
+		return eud_swd_flush_queue();
+
+	return ERROR_OK;
+}
+
+static int eud_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
+{
+	assert(cmd & SWD_CMD_RNW);
+	return eud_swd_queue_transfer(cmd, 0, value, ap_delay_clk);
+}
+
+static int eud_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
+{
+	assert(!(cmd & SWD_CMD_RNW));
+	return eud_swd_queue_transfer(cmd, value, NULL, ap_delay_clk);
+}
+
+static int eud_swd_flush_queue(void)
+{
+	uint8_t out[EUD_SWD_BUFFER_SIZE];
+	uint8_t in[EUD_SWD_BUFFER_SIZE];
+	unsigned int out_len = 0;
+	unsigned int in_len = 0;
+	unsigned int count = eud_queue_len;
+
+	for (unsigned int i = 0; i < count; i++) {
+		const struct eud_swd_transfer *transfer = &eud_queue[i];
+		uint8_t eud_cmd = (transfer->cmd | SWD_CMD_START | SWD_CMD_PARK) & ~SWD_CMD_STOP;
+
+		LOG_DEBUG_IO("%s %s reg %x %" PRIx32,
+				transfer->cmd & SWD_CMD_APNDP ? "AP" : "DP",
+				transfer->cmd & SWD_CMD_RNW ? "read" : "write",
+				(transfer->cmd & SWD_CMD_A32) >> 1,
+				transfer->value);
+
+		out[out_len++] = eud_cmd;
+		if (transfer->cmd & SWD_CMD_RNW) {
+			in_len += 4;
+		} else {
+			h_u32_to_le(&out[out_len], transfer->value);
+			out_len += 4;
+		}
+
+		if (transfer->ap_delay_clk) {
+			out[out_len++] = EUD_SWD_CMD_DITMS;
+			h_u32_to_le(&out[out_len],
+					FIELD_PREP(SWD_CMD_DITMS_COUNT, transfer->ap_delay_clk - 1));
+			out_len += 4;
+		}
+	}
+
+	out[out_len++] = EUD_SWD_CMD_STATUS;
+	in_len += EUD_SWD_STATUS_SIZE;
+
+	/*
+	 * The hardware auto-flushes once the IN FIFO is exactly full, so an
+	 * explicit FLUSH is only needed when the queue leaves it partially
+	 * filled.
+	 */
+	if (in_len != EUD_SWD_BUFFER_SIZE)
+		out[out_len++] = EUD_SWD_CMD_FLUSH;
+
+	assert(out_len <= sizeof(out));
+	assert(in_len <= sizeof(in));
+
+	LOG_DEBUG_IO("Flushing EUD SWD queue of %u transfers (%u bytes out, %u bytes in)",
+			count, out_len, in_len);
+
+	int retval = eud_bulk_write(&eud_swd, out, out_len);
+	if (retval != ERROR_OK)
+		goto out;
+
+	retval = eud_bulk_read(&eud_swd, in, in_len);
+	if (retval != ERROR_OK)
+		goto out;
+
+	unsigned int in_pos = 0;
+	for (unsigned int i = 0; i < count; i++) {
+		const struct eud_swd_transfer *transfer = &eud_queue[i];
+		if (transfer->cmd & SWD_CMD_RNW) {
+			uint32_t value = le_to_h_u32(&in[in_pos]);
+			in_pos += 4;
+			if (transfer->read_value)
+				*transfer->read_value = value;
+			LOG_DEBUG_IO("read result: %" PRIx32, value);
+		}
+	}
+
+	uint32_t status = le_to_h_u32(&in[in_pos]);
+
+	/*
+	 * A DP_TARGETSEL write is answered with silence, so whatever the
+	 * peripheral sampled during the ack phase is meaningless. Such a
+	 * transfer gets a queue of its own precisely so that its status can be
+	 * dropped without hiding the transfers around it.
+	 */
+	if (!swd_cmd_returns_ack(eud_queue[0].cmd)) {
+		assert(count == 1);
+		retval = ERROR_OK;
+		goto out;
+	}
+
+	/*
+	 * The ack belongs to the last command the peripheral processed and a
+	 * sticky DAP error makes every command after the first bad one fail
+	 * too, so a failure can only be attributed to the queue, not to a
+	 * transfer within it. Report how far the queue got instead.
+	 */
+	uint32_t processed = FIELD_GET(SWD_CMD_STATUS_CMD_CNTR, status);
+	uint8_t ack = FIELD_GET(SWD_CMD_STATUS_ACK, status);
+
+	if (status & SWD_CMD_STATUS_PARITY_ERR) {
+		LOG_ERROR("SWD parity error after %" PRIu32 " of %u transfers (status 0x%08" PRIx32 ")",
+				processed, count, status);
+		retval = ERROR_SWD_FAIL;
+		goto out;
+	}
+
+	if (status & SWD_CMD_STATUS_WAIT_TIMEOUT) {
+		LOG_DEBUG("SWD out of ACK.WAIT retries after %" PRIu32 " of %u transfers (status 0x%08" PRIx32 ")",
+				processed, count, status);
+		retval = ERROR_WAIT;
+		goto out;
+	}
+
+	if (ack != SWD_ACK_OK) {
+		LOG_DEBUG("SWD ack=%u after %" PRIu32 " of %u transfers (status 0x%08" PRIx32 ")",
+				ack, processed, count, status);
+		retval = swd_ack_to_error_code(ack);
+		goto out;
+	}
+
+	retval = ERROR_OK;
+
+out:
+	eud_queue_len = 0;
+	eud_queue_out_len = 0;
+	eud_queue_in_len = 0;
+	return retval;
 }
 
 static int eud_swd_run_queue(void)
 {
-	int retval = eud_queued_retval;
+	if (!eud_queue_len)
+		return ERROR_OK;
 
-	if (retval != ERROR_OK)
-		goto out;
-
-	for (unsigned int i = 0; i < eud_queue_len; i++) {
-		struct eud_swd_transfer *transfer = &eud_queue[i];
-		uint8_t out[8];
-		uint8_t in[8];
-		uint8_t eud_cmd = (transfer->cmd | SWD_CMD_START | SWD_CMD_PARK) & ~SWD_CMD_STOP;
-		int out_len;
-		int in_len;
-
-		LOG_DEBUG_IO("%s %s reg %x %" PRIx32,
-					 transfer->cmd & SWD_CMD_APNDP ? "AP" : "DP",
-					 transfer->cmd & SWD_CMD_RNW ? "read" : "write",
-					 (transfer->cmd & SWD_CMD_A32) >> 1,
-					 transfer->value);
-
-		out[0] = eud_cmd;
-		if (transfer->cmd & SWD_CMD_RNW) {
-			out[1] = EUD_SWD_CMD_STATUS;
-			out[2] = EUD_SWD_CMD_FLUSH;
-			out_len = 3;
-			in_len = 8;
-		} else {
-			h_u32_to_le(&out[1], transfer->value);
-			out[5] = EUD_SWD_CMD_STATUS;
-			out[6] = EUD_SWD_CMD_FLUSH;
-			out_len = 7;
-			in_len = 4;
-		}
-
-		retval = eud_bulk_write(&eud_swd, out, out_len);
-		if (retval != ERROR_OK)
-			goto out;
-
-		retval = eud_bulk_read(&eud_swd, in, in_len);
-		if (retval != ERROR_OK)
-			goto out;
-
-		uint32_t status;
-		if (transfer->cmd & SWD_CMD_RNW) {
-			uint32_t value = le_to_h_u32(in);
-			status = le_to_h_u32(&in[4]);
-			if (transfer->read_value)
-				*transfer->read_value = value;
-			LOG_DEBUG_IO("read result: %" PRIx32, value);
-		} else {
-			status = le_to_h_u32(in);
-		}
-
-		uint8_t ack = status & 0x07;
-		if (swd_cmd_returns_ack(transfer->cmd) && ack != SWD_ACK_OK && ack != 0) {
-			LOG_DEBUG("SWD ack not OK: %u status 0x%08" PRIx32, i, status);
-			retval = swd_ack_to_error_code(ack);
-			goto out;
-		}
-
-		if (transfer->ap_delay_clk)
-			retval = eud_ditms_u16(0, transfer->ap_delay_clk > 16 ? 16 : transfer->ap_delay_clk);
-
-		if (retval != ERROR_OK)
-			goto out;
-	}
-
-out:
-	eud_queue_len = 0;
-	eud_queued_retval = ERROR_OK;
-	return retval;
+	return eud_swd_flush_queue();
 }
 
 static int eud_init(void)
 {
+	eud_queue_len = 0;
+	eud_queue_out_len = 0;
+	eud_queue_in_len = 0;
+
 	int ret = libusb_init(&eud_libusb_ctx);
 	if (ret != LIBUSB_SUCCESS) {
 		LOG_ERROR("libusb_init() failed: %s", libusb_error_name(ret));
