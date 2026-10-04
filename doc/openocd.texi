@@ -5605,6 +5605,36 @@ read_memory 0x20000000 32 2
 @end example
 @end deffn
 
+@anchor{target_calculate_checksum}
+@deffn {Command} {$target_name calculate_checksum} address size
+Calculates the checksum of the memory region starting at @var{address} with a
+length of @var{size}.
+
+The checksum algorithm uses a 32-bit cyclic redundancy check (CRC) with the
+polynomial @code{0x04c11db7} and an initial seed of @code{0xffffffff}. There is
+no input or output reflection, and the XOR output mask is @code{0x00000000}.
+
+If available, the checksum is calculated on the target device using a loader
+function executed in the working area. This accelerates the calculation and
+avoids transferring the memory contents to the host.
+
+For example, to calculate the checksum of 1 KiB starting at address
+@code{0x08000000}, use the following command:
+@example
+calculate_checksum 0x08000000 1024
+0x4fae1a88
+@end example
+
+In Python, for example, the checksum for verification can be calculated as
+follows:
+@example
+from crccheck.crc import Crc32Mpeg2
+
+data = b'deadbeef'
+checksum = Crc32Mpeg2.calc(data, initvalue=0xffffffff)
+@end example
+@end deffn
+
 @deffn {Command} {$target_name cget} queryparm
 Each configuration parameter accepted by
 @command{$target_name configure}
@@ -8053,6 +8083,14 @@ flash bank $_FLASHNAME ocl 0 0 0 0 $_TARGETNAME
 @end example
 @end deffn
 
+@deffn {Flash Driver} {pac55xx}
+Supports the PAC55XX series from Qorvo.
+
+@example
+flash bank $_FLASHNAME pac55xx 0 0 0 0 $_TARGETNAME
+@end example
+@end deffn
+
 @deffn {Flash Driver} {pic32mx}
 The PIC32MX microcontrollers are based on the MIPS 4K cores,
 and integrate flash memory.
@@ -9802,6 +9840,20 @@ interface only. If your network environment is safe, @code{bindto
 0.0.0.0} can be used to cover all available interfaces.
 @end deffn
 
+@deffn {Command} {services}
+Return a Tcl list containing information about running services.
+Each list element is a Tcl dict containing all the information of a
+single service.
+@example
+> services
+@{
+    name gdb
+    port 53811
+    target tap.cpu
+@}
+@end example
+@end deffn
+
 @anchor{targetstatehandling}
 @section Target State handling
 @cindex reset
@@ -10111,22 +10163,6 @@ Dump @var{size} bytes of target memory starting at @var{address} to the
 binary file named @var{filename}.
 @end deffn
 
-@deffn {Command} {fast_load}
-Loads an image stored in memory by @command{fast_load_image} to the
-current target. Must be preceded by fast_load_image.
-@end deffn
-
-@deffn {Command} {fast_load_image} filename [address [@option{bin}|@option{ihex}|@option{elf}|@option{s19} [@option{min_addr} [@option{max_length}]]]]
-Normally you should be using @command{load_image} or GDB load. However, for
-testing purposes or when I/O overhead is significant(OpenOCD running on an embedded
-host), storing the image in memory and uploading the image to the target
-can be a way to upload e.g. multiple debug sessions when the binary does not change.
-Arguments are the same as @command{load_image}, but the image is stored in OpenOCD host
-memory, i.e. does not affect target. This approach is also useful when profiling
-target programming performance as I/O and target programming can easily be profiled
-separately.
-@end deffn
-
 @deffn {Command} {load_image} filename [address [@option{bin}|@option{ihex}|@option{elf}|@option{s19} [@option{min_addr} [@option{max_length}]]]]
 Load image from file @var{filename} to target memory.
 If an @var{address} is specified, it is used as an offset to the file format
@@ -10340,6 +10376,13 @@ Add or replace usage text on the given @var{command_name}.
 Returns current time since the Epoch in ms
 (See: @url{https://en.wikipedia.org/wiki/Epoch_(computing)}).
 Useful to compute delays in Tcl.
+@end deffn
+
+@deffn {Command} {calculate_checksum} address size
+Calculates the checksum of the memory region starting at @var{address} with a
+length of @var{size}.
+
+@xref{target_calculate_checksum,, $target_name calculate_checksum}, for more details.
 @end deffn
 
 @node Architecture and Core Commands
