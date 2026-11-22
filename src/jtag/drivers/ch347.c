@@ -52,6 +52,7 @@
 #include <helper/replacements.h>
 #include <helper/list.h>
 #include <helper/binarybuffer.h>
+#include <helper/align.h>
 #include "libusb_helper.h"
 
 // system includes
@@ -69,23 +70,16 @@
 #define TCK_L	0
 #define TRST_H BIT(5)
 #define TRST_L 0
-#define LED_ON 1
-#define LED_OFF	0
+#define SRST_H BIT(6)
+#define SRST_L 0
+
 #define GPIO_CNT	8 // the CH347 has 8 GPIO's
-/* mask which GPIO's are available in mode 3 of the CH347T: only GPIO3 (Pin11 / SCL),
-	GPIO4 (Pin15 / ACT), GPIO5 (Pin9 / TRST) and GPIO6 (Pin2 / CTS1) are possible */
-#define CH347T_USABLE_GPIOS	0x78
-/* On the CH347F the GPIO's share the pins with the interface signals: GPIO0 (Pin17),
-	GPIO1 (Pin18), GPIO2 (Pin10), GPIO3 (Pin9 / TRST), GPIO4 (Pin23 / TCK + SWDCLK),
-	GPIO5 (Pin24 / TDO), GPIO6 (Pin25 / TDI), GPIO7 (Pin26 / TMS + SWDIO). GPIO4 to GPIO7
-	always carry a signal of the JTAG or SWD interface, so only GPIO0 to GPIO3 are left.
-	GPIO3 is TRST, which is not a SWD signal. */
-#define CH347F_USABLE_GPIOS	0x0F
-/* In SWD mode the TRST pin is unused as a JTAG signal, so it can drive SRST through the GPIO
-	command. TRST is Pin9 on both chips, but has a different GPIO number: GPIO5 on CH347T,
-	GPIO3 on CH347F. */
+// SRST pin can be configured as CH347F_SRST_FAKE_GPIO
+#define GPIO_CNT_EXT (GPIO_CNT + 1)
+#define CH347F_SRST_FAKE_GPIO GPIO_CNT
 #define CH347T_TRST_GPIO	5
 #define CH347F_TRST_GPIO	3
+
 /* For GPIO command: always set bits 7 and 6 for GPIO enable
 	bits 5 and 4 for pin direction output bit 3 is the data bit */
 #define GPIO_SET_L	(BIT(4) | BIT(5) | BIT(6) | BIT(7)) // value for setting a GPIO to low
@@ -100,10 +94,11 @@
 // Don't send more than this amount of bytes via libusb in one packet. Also that is the limit for LARGER_PACK mode.
 #define LARGER_PACK_MAX_SIZE	51200
 // The data length contained in each command packet	during USB high-speed operation
+// REVISIT: could be USBC_PACKET_USBHS - CH347_CMD_HEADER ?
 #define UCMDPKT_DATA_MAX_BYTES_USBHS	507
 #define USBC_PACKET_USBHS	512 // Maximum data length per packet at USB high speed
 #define CH347_CMD_HEADER	3 // Protocol header length (1 byte command type + 2 bytes data length)
-#define CH347_CMD_INIT_READ_LEN	1 // for JTAG_INIT/SWD_INIT we have only one data byte
+#define CH347_CMD_INIT_READ_LEN	1 // JTAG_INIT/SWD_INIT/PIN_SET read one data byte
 // if we send 9 in the init command we get the STANDARD mode or LARGER_PACK mode flag
 #define CH347_CMD_INIT_GET_MODE_CLOCK_INDEX_VALUE 9
 // No more bits are allowed per CH347_CMD_JTAG_BIT_OP command; this should be dividable by 8
@@ -118,8 +113,7 @@
 #define CH347_CMD_JTAG_BIT_OP_RD	0xD2 // JTAG interface pin bit control and read commands
 #define CH347_CMD_JTAG_DATA_SHIFT	0xD3 // JTAG interface data shift command
 #define CH347_CMD_JTAG_DATA_SHIFT_RD	0xD4 // JTAG interface data shift and read command
-// for a single command these amount of data can be read at max
-#define CH347_SINGLE_CMD_MAX_READ	MAX(GPIO_CNT, CH347_CMD_INIT_READ_LEN)
+#define CH347_CMD_PIN_SET	0xE2 // set pin functions (CH347F)
 
 // for SWD
 #define CH347_CMD_SWD_INIT	0xE5 // SWD Interface Initialization Command
@@ -129,8 +123,8 @@
 #define CH347_CMD_SWD_REG_R	0xA2 // SWD Interface read  reg
 #define CH347_MAX_PROCESSING_US 7000 // max time in us for packet processing
 			  // USB hosts disconnect the adapter if SWD processing takes more!
-#define CH347_MAX_SEND_BUF	USBC_PACKET_USBHS
-#define CH347_MAX_RECV_BUF	USBC_PACKET_USBHS
+#define CH347_MAX_SEND_BUF	UCMDPKT_DATA_MAX_BYTES_USBHS
+#define CH347_MAX_RECV_BUF	(USBC_PACKET_USBHS - CH347_CMD_HEADER)
 #define CH347_MAX_CMD_BUF	128
 #define CH347_SWD_CLOCK_MAX 5000
 #define CH347_SWD_CLOCK_BASE 1000
@@ -216,6 +210,7 @@ struct ch347_info {
 	int tdi_pin;
 	int tck_pin;
 	int trst_pin;
+	int srst_pin;
 
 	enum ch347_variant chip_variant; // ch347_variant for explanation
 	// if true then we can't us the bytewise commands	due to a bug of the chip; depends on BYTEWISE_MODE_VERSION
@@ -223,6 +218,11 @@ struct ch347_info {
 	enum pack_size pack_size; // see: pack_size for explanation
 	int max_len; // in STANDARD_PACK or bitwise mode we can send only one USBC_PACKET_USBHS sized package
 	bool swclk_5mhz_supported;
+	bool cmd_gpio_allowed;
+	unsigned int srst_default_gpio, trst_default_gpio;
+	bool led_is_on;
+	bool led_log_once;
+	uint8_t bit_op_log_once;
 
 	// a "scratchpad" where we record all bytes for one command
 	uint8_t scratchpad_cmd_type; // command type
@@ -233,9 +233,11 @@ struct ch347_info {
 	struct list_head cmd_queue;
 	// all data input scan fields are queued here
 	struct list_head scan_queue;
-	// read buffer for the single commands like CH347_CMD_GPIO and CH347_CMD_JTAG_INIT
-	uint8_t single_read[CH347_SINGLE_CMD_MAX_READ];
-	int singe_read_len; // data length in single_read
+	// read buffer for the single commands like CH347_CMD_JTAG_INIT
+	uint8_t init_result_buf[CH347_CMD_INIT_READ_LEN];
+	int init_result_len;
+	// GPIO status returned by CH347_CMD_GPIO
+	uint8_t gpio_status_buf[GPIO_CNT];
 };
 
 struct ch347_swd_io {
@@ -252,7 +254,6 @@ struct ch347_swd_context {
 	int send_len;
 	int recv_len;
 	int need_recv_len;
-	int queued_retval;
 	int sent_cmd_count;
 	unsigned int clk_divisor;
 	unsigned int total_swd_clk;
@@ -263,22 +264,53 @@ struct ch347_swd_context {
 
 static struct ch347_swd_context ch347_swd_context;
 static bool swd_mode;
-static uint16_t default_ch347_vids[] = {DEFAULT_VENDOR_ID, DEFAULT_VENDOR_ID, DEFAULT_VENDOR_ID, 0};
-static uint16_t default_ch347_pids[] = {DEFAULT_CH347T_PRODUCT_ID,
+
+static const uint16_t default_ch347_vids[] = {DEFAULT_VENDOR_ID, DEFAULT_VENDOR_ID, DEFAULT_VENDOR_ID, 0};
+static const uint16_t default_ch347_pids[] = {DEFAULT_CH347T_PRODUCT_ID,
 	DEFAULT_CH347F_PRODUCT_ID, DEFAULT_OTHER_PRODUCT_ID, 0};
-static uint8_t ch347_activity_led_gpio_pin = 0xFF;
-static bool ch347_activity_led_active_high;
-// GPIO driving SRST in SWD mode, defaults to the otherwise unused TRST pin
-static uint8_t ch347_srst_gpio_pin = 0xFF;
-static bool ch347_srst_active_high;
+
+/* Set after the CH347F dedicated SRST output is enabled and its pin byte
+ * has been transmitted. JTAG pin bytes carry bit 6 only then. SWD leaves
+ * this clear. */
+static bool ch347_dedicated_srst_enabled;
 static struct ch347_info ch347;
 static struct libusb_device_handle *ch347_handle;
+
+struct ch347_bit_op {
+	uint8_t bit;
+	bool jtag_use, swd_use;
+	int *ptr;
+};
+static const struct ch347_bit_op ch347t_gpio_to_bit_op[GPIO_CNT_EXT] = {
+	[0] = { .bit = TCK_H, .jtag_use = true, .swd_use = true, .ptr = &ch347.tck_pin },
+	[1] = { .jtag_use = true },
+	[2] = { .bit = TMS_H, .jtag_use = true, .swd_use = true, .ptr = &ch347.tms_pin },
+	[CH347T_TRST_GPIO] = { .bit = TRST_H, .ptr = &ch347.trst_pin }, // GPIO 5
+};
+
+static const struct ch347_bit_op ch347f_gpio_to_bit_op[GPIO_CNT_EXT] = {
+	[CH347F_TRST_GPIO] = { .bit = TRST_H, .ptr = &ch347.trst_pin }, // GPIO 3
+	[4] = { .bit = TCK_H, .jtag_use = true, .swd_use = true, .ptr = &ch347.tck_pin },
+	[5] = { .jtag_use = true },
+	[6] = { .bit = TDI_H, .jtag_use = true, .ptr = &ch347.tdi_pin },
+	[7] = { .bit = TMS_H, .jtag_use = true, .swd_use = true, .ptr = &ch347.tms_pin },
+	[CH347F_SRST_FAKE_GPIO] = { .bit = SRST_H, .ptr = &ch347.srst_pin},
+};
 
 /* there are "single" commands. These commands can't be chained together and
 	need to be send as single command and need a read after write */
 static inline bool ch347_is_single_cmd_type(uint8_t type)
 {
-	return type == CH347_CMD_GPIO || type == CH347_CMD_JTAG_INIT || type == CH347_CMD_SWD_INIT;
+	return type == CH347_CMD_JTAG_INIT || type == CH347_CMD_SWD_INIT
+			|| type == CH347_CMD_PIN_SET;
+}
+
+/* The commands with variable data size can be concatenated in the scratchpad
+ * and split if the scratchpad overflows */
+static inline bool ch347_cmd_has_variable_data_size(uint8_t type)
+{
+	return type == CH347_CMD_JTAG_BIT_OP || type == CH347_CMD_JTAG_BIT_OP_RD
+			|| type == CH347_CMD_JTAG_DATA_SHIFT || type == CH347_CMD_JTAG_DATA_SHIFT_RD;
 }
 
 static void log_buf_dump(const uint8_t *data, unsigned int size, bool recv)
@@ -394,7 +426,8 @@ static int ch347_write_data(uint8_t *data, int *length)
 		int retval = jtag_libusb_bulk_write(ch347_handle, CH347_EPOUT, (char *)&data[i],
 			write_len, USB_WRITE_TIMEOUT, &transferred);
 		if (retval != ERROR_OK) {
-			LOG_ERROR("CH347 write fail");
+			LOG_ERROR("CH347 write fail (size %d)", write_len);
+			log_buf_dump(data, *length, false);
 			*length = 0;
 			return retval;
 		}
@@ -415,19 +448,22 @@ static int ch347_write_data(uint8_t *data, int *length)
 
 /**
  * @brief reads data from the CH347 via libusb driver
+ * See https://libusb.sourceforge.io/api-1.0/libusb_packetoverflow.html
+ * for explanation of avoiding LIBUSB_TRANSFER_OVERFLOW
  *
- * @param data Point to the data buffer
- * @param length Data length in and out
+ * @param data	Point to the data buffer
+ * @param buf_length Maximal length, aligned up to USB packet size
+ * @param length Minimal requested data length in and real read length out
  * @return ERROR_OK at success
  */
-static int ch347_read_data(uint8_t *data, int *length)
+static int ch347_read_data(uint8_t *data, int buf_length, int *length)
 {
-	int read_len = *length;
-	int i = 0;
-	int transferred = 0;
+	int done = 0;
 
-	while (true) {
-		int retval = jtag_libusb_bulk_read(ch347_handle, CH347_EPIN, (char *)&data[i],
+	do {
+		int transferred = 0;
+		int read_len = buf_length - done;
+		int retval = jtag_libusb_bulk_read(ch347_handle, CH347_EPIN, (char *)&data[done],
 			read_len, USB_READ_TIMEOUT, &transferred);
 		if (retval != ERROR_OK) {
 			LOG_ERROR("CH347 read fail");
@@ -435,18 +471,15 @@ static int ch347_read_data(uint8_t *data, int *length)
 			return retval;
 		}
 
-		i += transferred;
-		if (i >= *length)
-			break;
-		read_len = *length - i;
-	}
+		done += transferred;
+	} while (done < *length);
 
 	if (LOG_LEVEL_IS(LOG_LVL_DEBUG_IO)) {
-		LOG_DEBUG_IO("size=%d, buf=", i);
-		log_buf_dump(data, i, true);
+		LOG_DEBUG_IO("size=%d, buf=", done);
+		log_buf_dump(data, done, true);
 	}
 
-	*length = i;
+	*length = done;
 	return ERROR_OK;
 }
 
@@ -466,9 +499,13 @@ static void ch347_cmd_calc_reads(struct ch347_cmd *cmd)
 		// for GPIO we need to read back the same amount of data that we had send
 		cmd->read_len = cmd->write_data_len;
 		break;
+	case CH347_CMD_SWD:
+		cmd->read_len = ch347_swd_context.need_recv_len;
+		break;
 	case CH347_CMD_JTAG_INIT:
 	case CH347_CMD_SWD_INIT:
-		// for JTAG_INIT/SWD_INIT the amount is fixed
+	case CH347_CMD_PIN_SET:
+		// for JTAG_INIT/SWD_INIT/PIN_SET the amount is fixed
 		cmd->read_len = CH347_CMD_INIT_READ_LEN;
 		break;
 	case CH347_CMD_JTAG_BIT_OP_RD:
@@ -536,14 +573,15 @@ static int ch347_cmd_from_scratchpad(void)
  */
 static int ch347_read_scan(uint8_t *decoded_buf, int decoded_buf_len, int raw_read_len)
 {
-	int read_len = raw_read_len;
-	uint8_t *read_buf = malloc(read_len);
+	int read_bf_len = ALIGN_UP(raw_read_len, USBC_PACKET_USBHS);
+	uint8_t *read_buf = malloc(read_bf_len);
 	if (!read_buf) {
 		LOG_ERROR("malloc failed");
 		return ERROR_FAIL;
 	}
 
-	int retval = ch347_read_data(read_buf, &read_len);
+	int read_len = raw_read_len;
+	int retval = ch347_read_data(read_buf, read_bf_len, &read_len);
 	if (retval != ERROR_OK)	{
 		free(read_buf);
 		return retval;
@@ -556,38 +594,65 @@ static int ch347_read_scan(uint8_t *decoded_buf, int decoded_buf_len, int raw_re
 		unsigned int type = read_buf[rd_idx++];
 		uint16_t data_len = le_to_h_u16(&read_buf[rd_idx]);
 		rd_idx += 2;
-		if (decoded_buf_idx > decoded_buf_len) {
-			LOG_ERROR("CH347 decoded_buf too small");
-			free(read_buf);
-			return ERROR_FAIL;
-		}
-
-		// nothing to decode? Only read to make the CH347 happy!
-		if (!decoded_buf) {
-			rd_idx += data_len;
-			continue;
-		}
 
 		switch (type) {
-		case CH347_CMD_GPIO:
 		case CH347_CMD_JTAG_INIT:
 		case CH347_CMD_SWD_INIT:
+		case CH347_CMD_PIN_SET:
+			if (data_len != CH347_CMD_INIT_READ_LEN) {
+				LOG_ERROR("CH347 unexpected returned data length from init CMD");
+				free(read_buf);
+				return ERROR_FAIL;
+			}
+			memcpy(ch347.init_result_buf, &read_buf[rd_idx], data_len);
+			ch347.init_result_len = data_len;
+			rd_idx += data_len;
+			break;
+		case CH347_CMD_GPIO:
+			if (data_len != GPIO_CNT) {
+				LOG_ERROR("CH347 unexpected returned data length from CMD GPIO");
+				free(read_buf);
+				return ERROR_FAIL;
+			}
+			memcpy(ch347.gpio_status_buf, &read_buf[rd_idx], data_len);
+			rd_idx += data_len;
+			break;
 		case CH347_CMD_JTAG_DATA_SHIFT_RD:
-			// for all bytewise commands: copy the data bytes
+			// for bytewise commands: copy the data bytes
+			if (!decoded_buf || decoded_buf_idx + data_len > decoded_buf_len) {
+				LOG_ERROR("CH347 no decoded_buf or too small");
+				free(read_buf);
+				return ERROR_FAIL;
+			}
 			memcpy(&decoded_buf[decoded_buf_idx], &read_buf[rd_idx], data_len);
 			decoded_buf_idx += data_len;
 			rd_idx += data_len;
 			break;
 		case CH347_CMD_JTAG_BIT_OP_RD:
 			// for CH347_CMD_JTAG_BIT_OP_RD we need to copy bit by bit
+			if (!decoded_buf || decoded_buf_idx + DIV_ROUND_UP(data_len, 8) > decoded_buf_len) {
+				LOG_ERROR("CH347 no decoded_buf or too small");
+				free(read_buf);
+				return ERROR_FAIL;
+			}
 			for (int i = 0; i < data_len; i++) {
 				if (read_buf[rd_idx + i] & BIT(0))
 					decoded_buf[decoded_buf_idx + i / 8] |= BIT(i % 8);
 				else
 					decoded_buf[decoded_buf_idx + i / 8] &= ~(BIT(i % 8));
 			}
-			rd_idx += data_len;
 			decoded_buf_idx += DIV_ROUND_UP(data_len, 8);
+			rd_idx += data_len;
+			break;
+		case CH347_CMD_SWD:
+			if (data_len > sizeof(ch347_swd_context.recv_buf)) {
+				LOG_ERROR("CH347 SWD recv buf too small");
+				free(read_buf);
+				return ERROR_FAIL;
+			}
+			memcpy(ch347_swd_context.recv_buf, &read_buf[rd_idx], data_len);
+			ch347_swd_context.recv_len = data_len;
+			rd_idx += data_len;
 			break;
 		default:
 			LOG_ERROR("CH347 read command fail");
@@ -616,7 +681,7 @@ static int ch347_scan_data_to_fields(uint8_t *decoded_buf, int decoded_buf_len)
 	list_for_each_entry_safe(scan, tmp, &ch347.scan_queue, queue) {
 		for (int i = 0; i < scan->fields_len; i++) {
 			int num_bits = scan->fields[i].num_bits;
-			LOG_DEBUG("fields[%d].in_value[%d], read from bit offset: %d", i, num_bits, bit_offset);
+			LOG_DEBUG_IO("fields[%d].in_value[%d], read from bit offset: %d", i, num_bits, bit_offset);
 			// only if we need the value
 			if (scan->fields[i].in_value) {
 				uint8_t *capture_buf = malloc(DIV_ROUND_UP(num_bits, 8));
@@ -635,8 +700,7 @@ static int ch347_scan_data_to_fields(uint8_t *decoded_buf, int decoded_buf_len)
 				buf_cpy(captured, scan->fields[i].in_value, num_bits);
 				free(capture_buf);
 			} else {
-				if (LOG_LEVEL_IS(LOG_LVL_DEBUG_IO))
-					LOG_DEBUG_IO("field skipped");
+				LOG_DEBUG_IO("field skipped");
 			}
 			bit_offset += num_bits;
 		}
@@ -649,18 +713,36 @@ static int ch347_scan_data_to_fields(uint8_t *decoded_buf, int decoded_buf_len)
 		bit_offset = byte_offset * 8;
 	}
 
-	// if not all bytes are transferred: put the rest into single_read buffer
-	if (byte_offset < decoded_buf_len) {
-		ch347.singe_read_len = decoded_buf_len - byte_offset;
-		LOG_DEBUG("single read of %d bytes", ch347.singe_read_len);
-		if (ch347.singe_read_len > CH347_SINGLE_CMD_MAX_READ) {
-			LOG_ERROR("Can't read more than %d bytes for a single command!", CH347_SINGLE_CMD_MAX_READ);
-			ch347.singe_read_len = CH347_SINGLE_CMD_MAX_READ;
-		}
-		memcpy(ch347.single_read, &decoded_buf[byte_offset], ch347.singe_read_len);
-	}
+	if (byte_offset < decoded_buf_len)
+		LOG_DEBUG("decoded %d of %d bytes", byte_offset, decoded_buf_len);
 
 	return ERROR_OK;
+}
+
+/**
+ * @brief Drops everything queued but not transmitted yet: the scratchpad,
+ * the command queue and the scan fields waiting for data.
+ * Used in error paths, so stale commands are not sent with the next queue
+ * and stale scan fields (owned by the already freed jtag_command queue)
+ * are not filled in later.
+ */
+static void ch347_queues_discard(void)
+{
+	struct ch347_cmd *cmd, *tmp_cmd;
+	list_for_each_entry_safe(cmd, tmp_cmd, &ch347.cmd_queue, queue) {
+		list_del(&cmd->queue);
+		free(cmd->write_data);
+		free(cmd);
+	}
+
+	ch347.scratchpad_cmd_type = 0;
+	ch347.scratchpad_idx = 0;
+
+	struct ch347_scan *scan, *tmp;
+	list_for_each_entry_safe(scan, tmp, &ch347.scan_queue, queue) {
+		list_del(&scan->queue);
+		free(scan);
+	}
 }
 
 /**
@@ -669,7 +751,7 @@ static int ch347_scan_data_to_fields(uint8_t *decoded_buf, int decoded_buf_len)
  *
  * @return ERROR_OK at success
  */
-static int ch347_cmd_transmit_queue(void)
+static int ch347_cmd_transmit_queue_inner(void)
 {
 	// queue last command
 	int retval = ch347_cmd_from_scratchpad();
@@ -684,9 +766,8 @@ static int ch347_cmd_transmit_queue(void)
 	struct ch347_cmd *cmd;
 	int decoded_buf_len = 0;
 	list_for_each_entry(cmd, &ch347.cmd_queue, queue)
-		if (cmd->read_len > 0)
-			decoded_buf_len += ch347_is_single_cmd_type(cmd->type) ?
-				cmd->read_len : DIV_ROUND_UP(cmd->tdo_bit_count, 8);
+		if (cmd->read_len > 0 && ch347_cmd_has_variable_data_size(cmd->type))
+			decoded_buf_len += DIV_ROUND_UP(cmd->tdo_bit_count, 8);
 
 	// create the buffer for all decoded bytes
 	uint8_t *decoded_buf = NULL;
@@ -704,12 +785,15 @@ static int ch347_cmd_transmit_queue(void)
 		int total_len = 0;
 		int total_tdo_count = 0;
 		int bytes_to_write = 0;
+		int max_len = ch347.max_len;
 
 		list_for_each_entry(cmd, &ch347.cmd_queue, queue) {
 			total_len += CH347_CMD_HEADER + cmd->write_data_len;
 			total_tdo_count += cmd->tdo_bit_count;
+			if (cmd->type == CH347_CMD_GPIO)
+				max_len = USBC_PACKET_USBHS;
 			// don't exceed max length or max TDO bit count
-			if (total_len >= ch347.max_len || total_tdo_count >= HW_TDO_BUF_SIZE)
+			if (total_len >= max_len || total_tdo_count >= HW_TDO_BUF_SIZE)
 				break;
 			// remember the last cmd to send and bytes to send
 			last_cmd = cmd;
@@ -746,8 +830,8 @@ static int ch347_cmd_transmit_queue(void)
 			// need to read something back?
 			if (cmd->read_len > 0) {
 				bytes_to_read += CH347_CMD_HEADER + cmd->read_len;
-				current_decoded_buf_len += ch347_is_single_cmd_type(cmd->type) ?
-					cmd->read_len : DIV_ROUND_UP(cmd->tdo_bit_count, 8);
+				if (ch347_cmd_has_variable_data_size(cmd->type))
+					current_decoded_buf_len += DIV_ROUND_UP(cmd->tdo_bit_count, 8);
 			}
 
 			// cmd data no longer needed
@@ -787,10 +871,25 @@ static int ch347_cmd_transmit_queue(void)
 
 	// something decoded from the data read back from CH347?
 	if (decoded_buf) {
-		// put the decoded data into the scan fields or single_read buffer
+		// put the decoded data into the scan fields
 		retval = ch347_scan_data_to_fields(decoded_buf, decoded_buf_len);
 		free(decoded_buf);
 	}
+
+	return retval;
+}
+
+/**
+ * @brief Sends all queued commands and puts the data read back into the scan
+ * fields. On error, everything not transmitted yet is discarded
+ *
+ * @return ERROR_OK at success
+ */
+static int ch347_cmd_transmit_queue(void)
+{
+	int retval = ch347_cmd_transmit_queue_inner();
+	if (retval != ERROR_OK)
+		ch347_queues_discard();
 
 	return retval;
 }
@@ -803,9 +902,9 @@ static int ch347_cmd_transmit_queue(void)
  */
 static int ch347_cmd_start_next(uint8_t type)
 {
-	// different command type or non chainable command? (GPIO commands can't be concat)
+	// different command type or non chainable command?
 	uint8_t prev_type = ch347.scratchpad_cmd_type;
-	if (prev_type != type || ch347_is_single_cmd_type(type)) {
+	if (prev_type != type || !ch347_cmd_has_variable_data_size(type)) {
 		// something written in the scratchpad? => store it as command
 		if (prev_type != 0 && ch347.scratchpad_idx > 0) {
 			int retval = ch347_cmd_from_scratchpad();
@@ -813,7 +912,7 @@ static int ch347_cmd_start_next(uint8_t type)
 				return retval;
 
 			/* if the last queued command is not chainable we should send it immediately
-				because e.g. the GPIO command can't be combined with any other command */
+				because e.g. the init commands can't be combined with any other command */
 			if (ch347_is_single_cmd_type(prev_type)) {
 				retval = ch347_cmd_transmit_queue();
 				if (retval != ERROR_OK)
@@ -821,7 +920,7 @@ static int ch347_cmd_start_next(uint8_t type)
 			}
 		}
 
-		/* before we can send non chainable command ("single" like GPIO command) we should send all
+		/* before we can send non chainable command we should send all
 			other commands because we can't send it together with other commands */
 		if (ch347_is_single_cmd_type(type)) {
 			int retval = ch347_cmd_transmit_queue();
@@ -862,22 +961,22 @@ static int ch347_scan_queue_fields(struct scan_field *scan_fields, int scan_fiel
  * @brief Function executes the single command and deliver one byte from the buffer
  * that's read back from USB
  *
- * @param read_buf_idx index of the byte that should be returned
- * @param byte returns byte at index or if index is out of range the first byte
+ * @param byte returns result byte
  * @return ERROR_OK at success
  */
-static int ch347_single_read_get_byte(int read_buf_idx, uint8_t *byte)
+static int ch347_single_read_get_byte(uint8_t *byte)
 {
+	ch347.init_result_len = 0;
 	int retval = ch347_cmd_transmit_queue();
 	if (retval != ERROR_OK)
 		return retval;
 
-	if (read_buf_idx > CH347_SINGLE_CMD_MAX_READ || read_buf_idx < 0) {
-		LOG_ERROR("read_buf_idx out of range");
+	if (ch347.init_result_len < 1) {
+		LOG_ERROR("no init cmd result");
 		return ERROR_FAIL;
 	}
 
-	*byte = ch347.single_read[read_buf_idx];
+	*byte = ch347.init_result_buf[0];
 	return ERROR_OK;
 }
 
@@ -924,7 +1023,12 @@ static int ch347_scratchpad_add_byte(uint8_t byte)
  */
 static int ch347_scratchpad_add_pin_byte(void)
 {
-	return ch347_scratchpad_add_byte(ch347.tms_pin | ch347.tdi_pin | ch347.tck_pin | ch347.trst_pin);
+	uint8_t pins = ch347.tms_pin | ch347.tdi_pin | ch347.tck_pin | ch347.trst_pin;
+
+	if (ch347_dedicated_srst_enabled)
+		pins |= ch347.srst_pin;
+
+	return ch347_scratchpad_add_byte(pins);
 }
 
 /**
@@ -941,6 +1045,14 @@ static int ch347_scratchpad_add_bytes(uint8_t *bytes, int count)
 {
 	if (ch347.scratchpad_cmd_type == 0) {
 		LOG_ERROR("call ch347_next_cmd first!");
+		return ERROR_FAIL;
+	}
+
+	if (!ch347_cmd_has_variable_data_size(ch347.scratchpad_cmd_type)
+		&& count > UCMDPKT_DATA_MAX_BYTES_USBHS - ch347.scratchpad_idx) {
+		LOG_ERROR("BUG: CH347 command 0x%02" PRIx8
+				  " is not variable data size type and payload is too long",
+				  ch347.scratchpad_cmd_type);
 		return ERROR_FAIL;
 	}
 
@@ -961,6 +1073,48 @@ static int ch347_scratchpad_add_bytes(uint8_t *bytes, int count)
 		ch347_scratchpad_check_full();
 	}
 
+	return ERROR_OK;
+}
+
+/**
+ * @brief Enable the dedicated SRST output on CH347F devices.
+ *
+ * The 0xE2 command and its payload come from WCH's fork, commit 4fd5026aabb6
+ * ("feat: Add CH347F SRST configuration"):
+ * https://github.com/WCHSoftGroup/ch347/commit/4fd5026aabb62b941317b5d156d0eeaef4c43108
+ * That packet is {0xe2, 0x08, 0x00, 0x00, 0x81, ...}. The command queue adds
+ * the command and the length, so only the eight payload bytes are sent here.
+ * Bit 0 of the second payload byte selects the mode: 0x81 enables it and
+ * 0x80 disables it. Disabling does not tristate pin 8, so 0x80 is never sent.
+ *
+ * The byte read back from PIN_SET has no documented meaning, so it is logged
+ * and does not decide whether initialization succeeded.
+ *
+ * Pin 8 strongly drives low after the adapter powers up. PIN_SET only selects
+ * the dedicated output; a JTAG pin byte should follow to set the level.
+ *
+ * @return ERROR_OK on success, or the original error code when the command
+ * cannot be transmitted
+ */
+static int ch347_srst_enable(void)
+{
+	int retval = ch347_cmd_start_next(CH347_CMD_PIN_SET);
+	if (retval != ERROR_OK)
+		return retval;
+
+	uint8_t cmd_data[] = {0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+	retval = ch347_scratchpad_add_bytes(cmd_data, ARRAY_SIZE(cmd_data));
+	if (retval != ERROR_OK)
+		return retval;
+
+	uint8_t init_result;
+	retval = ch347_single_read_get_byte(&init_result);
+	if (retval != ERROR_OK)
+		return retval;
+
+	LOG_DEBUG("CH347F PIN_SET result %02" PRIx8, init_result);
+
+	ch347_dedicated_srst_enabled = true;
 	return ERROR_OK;
 }
 
@@ -991,15 +1145,13 @@ static int ch347_scratchpad_add_clock_tms(bool tms)
  */
 static int ch347_scratchpad_add_stableclocks(int count)
 {
-	if (ch347.scratchpad_cmd_type == 0) {
-		int retval = ch347_cmd_start_next(CH347_CMD_JTAG_BIT_OP);
-		if (retval != ERROR_OK)
-			return retval;
-	}
+	int retval = ch347_cmd_start_next(CH347_CMD_JTAG_BIT_OP);
+	if (retval != ERROR_OK)
+		return retval;
 
 	bool tms = ch347.tms_pin == TMS_H;
 	for (int i = 0; i < count; i++) {
-		int retval = ch347_scratchpad_add_clock_tms(tms);
+		retval = ch347_scratchpad_add_clock_tms(tms);
 		if (retval != ERROR_OK)
 			return retval;
 	}
@@ -1008,12 +1160,20 @@ static int ch347_scratchpad_add_stableclocks(int count)
 }
 
 /**
- * @brief Function to ensure that the clock is in a low state
+ * @brief Return TCK to its low idle level, if it isn't there already.
+ * Does not generate a clock cycle.
  *
  * @return ERROR_OK at success
  */
-static int ch347_scratchpad_add_idle_clock(void)
+static int ch347_scratchpad_add_tck_idle(void)
 {
+	if (ch347.tck_pin == TCK_L)
+		return ERROR_OK;
+
+	int retval = ch347_cmd_start_next(CH347_CMD_JTAG_BIT_OP);
+	if (retval != ERROR_OK)
+		return retval;
+
 	ch347.tck_pin = TCK_L;
 	return ch347_scratchpad_add_pin_byte();
 }
@@ -1040,7 +1200,7 @@ static int ch347_scratchpad_add_tms_change(const uint8_t *tms_value, int step, i
 			return retval;
 	}
 
-	return ch347_scratchpad_add_idle_clock();
+	return ERROR_OK;
 }
 
 /**
@@ -1073,7 +1233,7 @@ static int ch347_scratchpad_add_move_path(struct pathmove_command *cmd)
 		tap_set_state(cmd->path[i]);
 	}
 
-	return ch347_scratchpad_add_idle_clock();
+	return ERROR_OK;
 }
 
 /**
@@ -1132,8 +1292,13 @@ static int ch347_scratchpad_add_write_read(struct scan_command *cmd, uint8_t *bi
 
 	// if we need to send bytes
 	if (byte_count > 0) {
+		// a byte shift started with TCK high corrupts the scan
+		int retval = ch347_scratchpad_add_tck_idle();
+		if (retval != ERROR_OK)
+			return retval;
+
 		// start the next cmd and copy the data out bytes to it
-		int retval = ch347_cmd_start_next(is_read ? CH347_CMD_JTAG_DATA_SHIFT_RD : CH347_CMD_JTAG_DATA_SHIFT);
+		retval = ch347_cmd_start_next(is_read ? CH347_CMD_JTAG_DATA_SHIFT_RD : CH347_CMD_JTAG_DATA_SHIFT);
 		if (retval != ERROR_OK)
 			return retval;
 
@@ -1184,11 +1349,6 @@ static int ch347_scratchpad_add_write_read(struct scan_command *cmd, uint8_t *bi
 				return retval;
 		}
 	}
-
-	// one TCK_L after the last bit
-	retval = ch347_scratchpad_add_idle_clock();
-	if (retval != ERROR_OK)
-		return retval;
 
 	// if read is involved we need to queue the scan fields
 	if (is_read)
@@ -1266,47 +1426,13 @@ static int ch347_scratchpad_add_scan(struct scan_command *cmd)
 }
 
 /**
- * @brief Mask of the GPIO's that don't collide with an interface signal
+ * @brief GPIO number of the TRST pin
  *
- * @return mask with a bit set for every usable GPIO
+ * @return GPIO number of the TRST pin of the chip variant
  */
-static uint8_t ch347_usable_gpios(void)
+static inline unsigned int ch347_trst_gpio(void)
 {
-	return ch347.chip_variant == CH347F ? CH347F_USABLE_GPIOS : CH347T_USABLE_GPIOS;
-}
-
-/**
- * @brief Sends a GPIO command for a single pin and returns the pin state
- * that the device reports back
- *
- * Only the byte of the addressed pin is filled in, all other bytes stay zero.
- * A zero byte means "not enabled" for the device, so the other pins keep
- * their configuration.
- *
- * @param gpio GPIO bit number 0-7
- * @param value byte for this pin, one of GPIO_SET_L, GPIO_SET_H, GPIO_SET_INPUT
- * @param state returns the byte the device reports for this pin; BIT(6) is the pin level
- * @return ERROR_OK at success
- */
-static int ch347_gpio_cmd(unsigned int gpio, uint8_t value, uint8_t *state)
-{
-	if (gpio >= GPIO_CNT) {
-		LOG_ERROR("GPIO %u out of range", gpio);
-		return ERROR_FAIL;
-	}
-
-	int retval = ch347_cmd_start_next(CH347_CMD_GPIO);
-	if (retval != ERROR_OK)
-		return retval;
-
-	uint8_t gpios[GPIO_CNT];
-	memset(gpios, 0, GPIO_CNT);
-	gpios[gpio] = value;
-	retval = ch347_scratchpad_add_bytes(gpios, GPIO_CNT);
-	if (retval != ERROR_OK)
-		return retval;
-
-	return ch347_single_read_get_byte(gpio, state);
+	return ch347.chip_variant == CH347F ? CH347F_TRST_GPIO : CH347T_TRST_GPIO;
 }
 
 /**
@@ -1334,108 +1460,239 @@ static uint8_t ch347_gpio_drive_value(bool level, enum adapter_gpio_drive_mode d
 	return level ? GPIO_SET_H : GPIO_SET_L;
 }
 
-/**
- * @brief Sets a GPIO bit
- *
- * @param gpio GPIO bit number 0-7
- * @param data true for high; false for low
- * @return ERROR_OK at success
- */
-static int ch347_gpio_set(int gpio, bool data)
+static int ch347_check_gpio_unique(enum adapter_gpio_config_index gpio_idx,
+								   unsigned int *gpios_used)
 {
-	/* always set bits 7 and 6 for GPIO enable
-		bits 5 and 4 for pin direction output
-		bit 3 is the data bit */
-	uint8_t state;
-	int retval = ch347_gpio_cmd(gpio, data ? GPIO_SET_H : GPIO_SET_L, &state);
-	if (retval != ERROR_OK)
-		return retval;
+	const struct adapter_gpio_config *gpio_config = &adapter_gpio_get_config()[gpio_idx];
+	if (gpio_config->gpio_num == ADAPTER_GPIO_NOT_SET)
+		return ERROR_OK;
 
-	// check in the read if the bit is set/cleared correctly
-	if ((bool)(state & BIT(6)) != data) {
-		LOG_ERROR("Output not set.");
+	if (gpio_config->gpio_num >= GPIO_CNT_EXT)
+		return ERROR_OK;	// invalid GPIO num will be reported later
+
+	if (BIT(gpio_config->gpio_num) & *gpios_used) {
+		LOG_ERROR("%s GPIO %u already used",
+				  adapter_gpio_get_name(gpio_idx),
+				  gpio_config->gpio_num);
 		return ERROR_FAIL;
 	}
 
+	*gpios_used |= BIT(gpio_config->gpio_num);
 	return ERROR_OK;
+}
+
+static unsigned int ch347_get_gpio_num_or_default(enum adapter_gpio_config_index gpio_idx)
+{
+	const struct adapter_gpio_config *gpio_config = &adapter_gpio_get_config()[gpio_idx];
+	if (gpio_config->gpio_num == ADAPTER_GPIO_NOT_SET) {
+		if (gpio_idx == ADAPTER_GPIO_IDX_SRST)
+			return ch347.srst_default_gpio;
+
+		if (gpio_idx == ADAPTER_GPIO_IDX_TRST)
+			return ch347.trst_default_gpio;
+	}
+	return gpio_config->gpio_num;
+}
+
+static int ch347_set_gpio(enum adapter_gpio_config_index gpio_idx, bool active,
+						   uint8_t *gpios_data, uint8_t *bit_op)
+{
+	const struct adapter_gpio_config *gpio_config = &adapter_gpio_get_config()[gpio_idx];
+	unsigned int gpio_num = ch347_get_gpio_num_or_default(gpio_idx);
+	const struct ch347_bit_op *gpio_to_bit_op = ch347.chip_variant == CH347F ?
+					ch347f_gpio_to_bit_op : ch347t_gpio_to_bit_op;
+	bool value = active ^ gpio_config->active_low;
+	uint8_t gpio_val = ch347_gpio_drive_value(value, gpio_config->drive);
+
+	/* Using both CH347_CMD_GPIO and CH347_CMD_JTAG_BIT_OP is tricky
+	 * but the only way to use GPIO capabilities (simulated open-drain)
+	 * together with JTAG and/or with the CH347F dedicated SRST pin.
+	 *
+	 * CH347T Chip version=2.41 does not support CH347_CMD_GPIO at all
+	 * - GPIO support blocked by cmd_gpio_allowed = false.
+	 *
+	 * CH347T Chip version=4.41 honours CH347_CMD_GPIO setting
+	 * to input and prevents CH347_CMD_JTAG_BIT_OP from changing the same
+	 * pin to output. Pin previously set by CH347_CMD_GPIO to output
+	 * gets updated by CH347_CMD_JTAG_BIT_OP.
+	 *
+	 * CH347T Chip version=5.44 and CH347F Chip version=1.20:
+	 * The pin previously set by CH347_CMD_GPIO to input works as open-drain
+	 * with respect to CH347_CMD_JTAG_BIT_OP. Bit op setting to L propagates
+	 * low level to the pin, setting to H switches the pin to Hi-Z.
+	 * Pin previously set by CH347_CMD_GPIO to output gets updated
+	 * by CH347_CMD_JTAG_BIT_OP.
+	 *
+	 * It means for all pins controlled by both CH347_CMD_JTAG_BIT_OP
+	 * and CH347_CMD_GPIO: the bit keeping the pin state
+	 * for CH347_CMD_JTAG_BIT_OP must follow CH347_CMD_GPIO output state
+	 * and must be set to H if GPIO is set to input. */
+	if (gpio_num < GPIO_CNT && ch347.cmd_gpio_allowed) {
+		gpios_data[gpio_num] = gpio_val;
+
+		// set the corresponding bit for CH347_CMD_JTAG_BIT_OP
+		if (gpio_to_bit_op[gpio_num].ptr) {
+			if (gpio_val == GPIO_SET_INPUT)
+				value = true;	/* input setting by CH347_CMD_GPIO keeps
+								 * precedence while CH347_CMD_JTAG_BIT_OP
+								 * sets the same pin to output H */
+			*gpio_to_bit_op[gpio_num].ptr = value ? gpio_to_bit_op[gpio_num].bit : 0;
+		}
+
+		return ERROR_OK;
+	}
+
+	if (gpio_num < GPIO_CNT_EXT) {
+		if (gpio_to_bit_op[gpio_num].ptr) {
+			*gpio_to_bit_op[gpio_num].ptr = value ? gpio_to_bit_op[gpio_num].bit : 0;
+			*bit_op |= gpio_to_bit_op[gpio_num].bit;
+
+			if (gpio_val == GPIO_SET_INPUT && gpio_to_bit_op[gpio_num].bit & ~ch347.bit_op_log_once) {
+				LOG_WARNING("%s drive mode ignored, GPIO %u is push-pull only",
+							adapter_gpio_get_name(gpio_idx),
+							gpio_num);
+				ch347.bit_op_log_once |= gpio_to_bit_op[gpio_num].bit;
+			}
+			return ERROR_OK;
+		}
+	}
+
+	// Settings failed, reaction is GPIO specific
+	if (gpio_idx == ADAPTER_GPIO_IDX_LED) {
+		if (gpio_num == ADAPTER_GPIO_NOT_SET)
+			return ERROR_OK;
+		else if (ch347.led_log_once)
+			return ERROR_FAIL;
+
+		ch347.led_log_once = true;
+	} else if (!active) {
+		return ERROR_OK;
+	}
+	if (gpio_num == ADAPTER_GPIO_NOT_SET)
+		LOG_ERROR("%s GPIO not configured", adapter_gpio_get_name(gpio_idx));
+	else if (gpio_num < GPIO_CNT && !ch347.cmd_gpio_allowed)
+		LOG_ERROR("Too old CH347 version, %s GPIO configuration not supported",
+				adapter_gpio_get_name(gpio_idx));
+	else
+		LOG_ERROR("%s GPIO configuration invalid", adapter_gpio_get_name(gpio_idx));
+
+	return ERROR_FAIL;
+}
+
+static int ch347_init_gpio(enum adapter_gpio_config_index gpio_idx,
+							uint8_t *gpios_data, uint8_t *bit_op)
+{
+	const struct adapter_gpio_config *gpio_config = &adapter_gpio_get_config()[gpio_idx];
+	if (gpio_config->init_state == ADAPTER_GPIO_INIT_STATE_INPUT) {
+		unsigned int gpio_num = ch347_get_gpio_num_or_default(gpio_idx);
+		if (gpio_num < GPIO_CNT && ch347.cmd_gpio_allowed) {
+			gpios_data[gpio_num] = GPIO_SET_INPUT;
+			return ERROR_OK;
+		}
+		LOG_WARNING("Cannot set %s GPIO to initial input state",
+					adapter_gpio_get_name(gpio_idx));
+	}
+	bool active = gpio_config->init_state == ADAPTER_GPIO_INIT_STATE_ACTIVE;
+	return ch347_set_gpio(gpio_idx, active, gpios_data, bit_op);
+}
+
+static int ch347_exit_gpio(enum adapter_gpio_config_index gpio_idx,
+							uint8_t *gpios_data, uint8_t *bit_op)
+{
+	const struct adapter_gpio_config *gpio_config = &adapter_gpio_get_config()[gpio_idx];
+	if (gpio_config->exit_state == ADAPTER_GPIO_EXIT_STATE_NO_CHANGE)
+		return ERROR_OK;
+
+	if (gpio_config->exit_state == ADAPTER_GPIO_EXIT_STATE_INPUT) {
+		unsigned int gpio_num = ch347_get_gpio_num_or_default(gpio_idx);
+		if (gpio_num < GPIO_CNT && ch347.cmd_gpio_allowed) {
+			gpios_data[gpio_num] = GPIO_SET_INPUT;
+			return ERROR_OK;
+		}
+		LOG_WARNING("Cannot set %s GPIO to exit input state",
+					adapter_gpio_get_name(gpio_idx));
+	}
+	bool active = gpio_config->exit_state == ADAPTER_GPIO_EXIT_STATE_ACTIVE;
+	return ch347_set_gpio(gpio_idx, active, gpios_data, bit_op);
+}
+
+/**
+ * @brief Update GPIOS or JTAG_BIT_OP controlled outputs
+ * Avoid failing on the first error - the second part may succeed
+ *
+ * @return ERROR_OK at success or the first error
+ */
+static int ch347_gpios_update(uint8_t *gpios_data, bool bit_op, bool flush_now)
+{
+	int retval1 = ERROR_OK;
+	if (bit_op) {
+		retval1 = ch347_cmd_start_next(CH347_CMD_JTAG_BIT_OP);
+		if (retval1 == ERROR_OK)
+			retval1 = ch347_scratchpad_add_pin_byte();
+	}
+
+	unsigned int i;
+	for (i = 0; i < GPIO_CNT; i++)
+		if (gpios_data[i])
+			break;
+
+	bool any_gpio_set = i < GPIO_CNT;
+	int retval2 = ERROR_OK;
+	if (any_gpio_set) {
+		retval2 = ch347_cmd_start_next(CH347_CMD_GPIO);
+		if (retval2 == ERROR_OK)
+			retval2 = ch347_scratchpad_add_bytes(gpios_data, GPIO_CNT);
+	}
+	if (retval1 == ERROR_OK)
+		retval1 = retval2;
+
+	if (flush_now && (bit_op || any_gpio_set))
+		retval2 = ch347_cmd_transmit_queue();
+
+	return retval1 == ERROR_OK ? retval2 : retval1;
 }
 
 /**
  * @brief Turn the activity LED on or off
- *
- * @param led_state LED_ON or LED_OFF
- * @return ERROR_OK at success or if pin is not configured
+ * Errors are intentionally ignored.
  */
-static int ch347_activity_led_set(int led_state)
+static void ch347_activity_led_set(bool led_state, bool flush_now)
 {
-	if (ch347_activity_led_gpio_pin != 0xFF)
-		return ch347_gpio_set(ch347_activity_led_gpio_pin, ch347_activity_led_active_high ? led_state : 1 - led_state);
+	uint8_t gpios[GPIO_CNT] = { 0 };
+	uint8_t bit_op = 0;
 
-	// not configured => also OK
-	return ERROR_OK;
+	ch347_set_gpio(ADAPTER_GPIO_IDX_LED, led_state, gpios, &bit_op);
+	int retval = ch347_gpios_update(gpios, bit_op, flush_now);
+	if (retval != ERROR_OK)
+		ch347.led_is_on = false;
+	else
+		ch347.led_is_on = led_state;
 }
 
 /**
  * @brief Control (assert/deassert) the signals SRST and TRST on the interface.
  *
- * In SWD mode TRST is not used as a JTAG signal, so the pin is driven as a
- * GPIO to provide SRST. In JTAG mode the pin is TRST and SRST is unavailable.
- *
- * The SRST GPIO follows the drive mode configured with 'reset_config'.
+ * Employs 'adapter gpio' configuration for both signals.
+ * Avoid failing on the first error - the second part may succeed
  *
  * @param trst 1 to assert TRST, 0 to deassert TRST.
  * @param srst 1 to assert SRST, 0 to deassert SRST.
- * @return ERROR_FAIL for asserting SRST in JTAG mode.
- * ERROR_OK for assert/deassert in JTAG mode for TRST and in SWD mode for SRST
+ * @return error code propagated from CH347_CMD_JTAG_BIT_OP or CH347_CMD_GPIO
+ * or ERROR_OK
  */
 static int ch347_reset(int trst, int srst)
 {
 	LOG_DEBUG_IO("reset trst: %i srst %i", trst, srst);
 
-	if (swd_mode) {
-		if (trst)
-			LOG_WARNING("Asserting TRST not supported in SWD mode!");
+	uint8_t gpios[GPIO_CNT] = { 0 };
+	uint8_t bit_op = 0;
+	int retval1 = ch347_set_gpio(ADAPTER_GPIO_IDX_SRST, srst, gpios, &bit_op);
+	int retval2 = ch347_set_gpio(ADAPTER_GPIO_IDX_TRST, trst, gpios, &bit_op);
+	if (retval1 == ERROR_OK)
+		retval1 = retval2;
 
-		if (ch347_srst_gpio_pin == 0xFF) {
-			if (srst) {
-				LOG_ERROR("Asserting SRST not supported: no usable GPIO configured");
-				return ERROR_FAIL;
-			}
-			return ERROR_OK;
-		}
-
-		/* Honour the drive mode of 'reset_config'. It defaults to open drain,
-			which releases the pin instead of driving the inactive level, so the
-			target can keep the line low on its own.
-			Don't verify the readback: it reports the pin level, and the target
-			is free to hold the reset line low itself, e.g. while it is in a
-			watchdog reset loop. */
-		bool level = srst ? ch347_srst_active_high : !ch347_srst_active_high;
-		uint8_t value = ch347_gpio_drive_value(level,
-			adapter_gpio_get_config()[ADAPTER_GPIO_IDX_SRST].drive);
-		uint8_t state;
-		return ch347_gpio_cmd(ch347_srst_gpio_pin, value, &state);
-	}
-
-	if (srst) {
-		LOG_ERROR("Asserting SRST not supported");
-		return ERROR_FAIL;
-	}
-
-	int retval = ch347_cmd_start_next(CH347_CMD_JTAG_BIT_OP);
-	if (retval != ERROR_OK)
-		return retval;
-
-	ch347.trst_pin = trst ? TRST_L : TRST_H;
-	retval = ch347_scratchpad_add_pin_byte();
-	if (retval != ERROR_OK)
-		return retval;
-
-	retval = ch347_scratchpad_add_idle_clock();
-	if (retval != ERROR_OK)
-		return retval;
-
-	return ch347_cmd_transmit_queue();
+	retval2 = ch347_gpios_update(gpios, bit_op, true);
+	return retval1 != ERROR_OK ? retval1 : retval2;
 }
 
 /**
@@ -1447,7 +1704,9 @@ static int ch347_reset(int trst, int srst)
 static int ch347_sleep(int us)
 {
 	LOG_DEBUG_IO("us=%d", us);
-	int retval = ch347_cmd_transmit_queue();
+	int retval = ch347_scratchpad_add_tck_idle();
+	if (retval == ERROR_OK)
+		retval = ch347_cmd_transmit_queue();
 	jtag_sleep(us);
 	return retval;
 }
@@ -1460,10 +1719,9 @@ static int ch347_sleep(int us)
 static int ch347_execute_queue(struct jtag_command *cmd_queue)
 {
 	struct jtag_command *cmd = cmd_queue;
+	int retval = ERROR_OK;
 
-	int retval = ch347_activity_led_set(LED_ON);
-	if (retval != ERROR_OK)
-		return retval;
+	ch347_activity_led_set(true, false);
 
 	while (retval == ERROR_OK && cmd) {
 		switch (cmd->type) {
@@ -1497,14 +1755,20 @@ static int ch347_execute_queue(struct jtag_command *cmd_queue)
 		cmd = cmd->next;
 	}
 
+	if (retval == ERROR_OK)
+		retval = ch347_scratchpad_add_tck_idle();
+
+	/* drop the partially queued commands, the LED off goes with the next queue */
+	if (retval != ERROR_OK)
+		ch347_queues_discard();
+
+	ch347_activity_led_set(false, false);
+
 	if (retval != ERROR_OK)
 		return retval;
 
 	retval = ch347_cmd_transmit_queue();
-	if (retval != ERROR_OK)
-		return retval;
-
-	return ch347_activity_led_set(LED_OFF);
+	return retval;
 }
 
 /**
@@ -1598,7 +1862,8 @@ static int ch347_open_device(void)
 		strcpy(serial_number, "(unknown)");
 	}
 
-	LOG_INFO("CH347 %s from vendor %s with serial number %s found. (Chip version=%X.%2X, Firmware=0x%02X)",
+	LOG_INFO("CH347%c %s from vendor %s with serial number %s found. (Chip version=%X.%02X, Firmware=0x%02X)",
+		ch347.chip_variant == CH347T ? 'T' : ch347.chip_variant == CH347F ? 'F' : '?',
 		product,
 		manufacturer,
 		serial_number,
@@ -1606,16 +1871,20 @@ static int ch347_open_device(void)
 		ch347_device_descriptor.bcdDevice & 0xFF,
 		firmware_version);
 
-	if (ch347.chip_variant == CH347T && ch347_device_descriptor.bcdDevice < BYTEWISE_MODE_VERSION) {
-		LOG_INFO("CH347T old version of the chip, JTAG only working in bitwise mode. For bytewise mode at least version %X.%X is needed.",
-			(BYTEWISE_MODE_VERSION >> 8) & 0xFF,
-			BYTEWISE_MODE_VERSION & 0xFF);
-		ch347.use_bitwise_mode = true;
-	} else {
-		ch347.use_bitwise_mode = false;
-	}
+	ch347.use_bitwise_mode = false;
+	ch347.cmd_gpio_allowed = true;
 
 	if (ch347.chip_variant == CH347T) {
+		if (ch347_device_descriptor.bcdDevice < BYTEWISE_MODE_VERSION) {
+			ch347.use_bitwise_mode = true;
+			LOG_INFO("CH347T old version of the chip, JTAG only working in bitwise mode. For bytewise mode at least version %X.%X is needed.",
+				(BYTEWISE_MODE_VERSION >> 8) & 0xFF,
+				BYTEWISE_MODE_VERSION & 0xFF);
+		}
+
+		if (ch347_device_descriptor.bcdDevice < 0x441)
+			ch347.cmd_gpio_allowed = false;
+
 		if (swd_mode) {
 			ch347.swclk_5mhz_supported = ch347_device_descriptor.bcdDevice >= 0x544;
 
@@ -1649,11 +1918,17 @@ static int ch347_open_device(void)
  */
 static int ch347_quit(void)
 {
-	// on close set the LED on, because the state without JTAG is on
-	ch347_activity_led_set(LED_ON);
-	int retval = ch347_cmd_transmit_queue();
+	int retval;
+	uint8_t gpios[GPIO_CNT] = { 0 };
+	uint8_t bit_op = 0;
+	ch347_exit_gpio(ADAPTER_GPIO_IDX_SRST, gpios, &bit_op);
+	ch347_exit_gpio(ADAPTER_GPIO_IDX_TRST, gpios, &bit_op);
+	ch347_exit_gpio(ADAPTER_GPIO_IDX_LED, gpios, &bit_op);
+
+	retval = ch347_gpios_update(gpios, bit_op, true);
+
 	jtag_libusb_close(ch347_handle);
-	LOG_DEBUG_IO("CH347 close");
+	LOG_DEBUG("CH347 close");
 	return retval;
 }
 
@@ -1689,7 +1964,7 @@ static int ch347_adapter_init(uint8_t clock_index, bool *supports_larger_pack_mo
 	}
 
 	uint8_t mode;
-	retval = ch347_single_read_get_byte(0, &mode);
+	retval = ch347_single_read_get_byte(&mode);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -1744,7 +2019,7 @@ static int ch347_swd_init_cmd(uint8_t clock_divisor)
 			But how can we decide if SWD init was successfully executed?
 			Return an error code if init was failed */
 	uint8_t init_result = 0;
-	retval = ch347_single_read_get_byte(0, &init_result);
+	retval = ch347_single_read_get_byte(&init_result);
 	LOG_DEBUG("SWD init clk div %" PRIu8 ", result %02" PRIx8,
 			  clock_divisor, init_result);
 	ch347_swd_context.clk_divisor = clock_divisor;
@@ -1796,9 +2071,9 @@ static int ch347_init_pack_size(void)
 }
 
 /**
- * @brief returns the speed in kHz by the give speed index
+ * @brief returns the speed in kHz for the given speed index
  *
- * @param speed_idx CH347 speed index
+ * @param speed_idx CH347 speed index (JTAG) or clock divisor (SWD)
  * @param khz Output of the speed in kHz
  * @return ERROR_OK on success
  */
@@ -1822,10 +2097,12 @@ static int ch347_speed_get(int speed_idx, int *khz)
 }
 
 /**
- * @brief multiplies the input speed by 1000
+ * @brief converts the requested speed to a CH347 speed index
+ *
+ * If possible, selects the highest supported speed not exceeding the requested one.
  *
  * @param khz Speed in kHz
- * @param speed_idx CH347 speed index
+ * @param speed_idx Output of the CH347 speed index (JTAG) or clock divisor (SWD)
  * @return ERROR_OK at success; ERROR_FAIL if khz is zero
  */
 static int ch347_speed_get_index(int khz, int *speed_idx)
@@ -1847,7 +2124,7 @@ static int ch347_speed_get_index(int khz, int *speed_idx)
 		return ERROR_OK;
 	}
 
-	// when checking with speed index 9 we can see if the device supports STANDARD_PACK or LARGER_PACK mode
+	// the available clock speeds depend on STANDARD_PACK or LARGER_PACK mode support
 	int retval = ch347_init_pack_size();
 	if (retval != ERROR_OK)
 		return retval;
@@ -1856,23 +2133,13 @@ static int ch347_speed_get_index(int khz, int *speed_idx)
 		ch347_standard_pack_clock_speeds : ch347_larger_pack_clock_speeds;
 	int length = ch347.pack_size == STANDARD_PACK ?
 		ARRAY_SIZE(ch347_standard_pack_clock_speeds) : ARRAY_SIZE(ch347_larger_pack_clock_speeds);
-	int idx = -1;
-	int lower_bound = 0;
 	// find the suitable speed index
-	for (int i = 0; i < length; i++) {
-		if (khz >= lower_bound && khz <= speeds[i]) {
-			idx = i;
-			break;
-		}
-		lower_bound = speeds[i];
-	}
-	// too high! => use max possible speed
-	if (idx == -1) {
-		LOG_INFO("Speed %d kHz is higher than highest speed of %d kHz. Using %d khz!",
-			khz, speeds[length - 1], speeds[length - 1]);
-		idx = length - 1;
-	} else if (speeds[idx] != khz) {
-		LOG_INFO("Requested speed of %d kHz is not possible. Using the next higher speed of %d kHz!",
+	int idx = length - 1;
+	while (idx > 0 && speeds[idx] > khz)
+		idx--;
+
+	if (speeds[idx] > khz) {
+		LOG_WARNING("Requested speed of %d kHz is not possible. Using %d kHz",
 			khz, speeds[idx]);
 	}
 	*speed_idx = idx;
@@ -1890,64 +2157,6 @@ static const struct command_registration ch347_command_handlers[] = {
 };
 
 /**
- * @brief Configure which GPIO pin is used as the activity LED.
- *
- * Updates the global activity LED GPIO pin and polarity settings
- * based on the provided configuration. If the given GPIO is not
- * usable, the function returns without making changes.
- *
- * @param led_config Pointer to the GPIO configuration structure for the LED pin
- */
-static void ch347_configure_activity_led(const struct adapter_gpio_config *led_config)
-{
-	uint8_t gpio = led_config->gpio_num;
-	if (gpio >= GPIO_CNT || (BIT(gpio) & ch347_usable_gpios()) == 0)
-		return;
-
-	ch347_activity_led_gpio_pin = gpio;
-	ch347_activity_led_active_high = !led_config->active_low;
-}
-
-/**
- * @brief Configure which GPIO pin drives SRST in SWD mode.
- *
- * Defaults to the TRST pin, which is unused in SWD mode. A different pin can
- * be selected with 'adapter gpio srst'. If the configured GPIO is not usable
- * or is already taken by the activity LED, SRST gets disabled.
- *
- * Must be called after ch347_configure_activity_led().
- *
- * @param srst_config Pointer to the GPIO configuration structure for the SRST pin
- */
-static void ch347_configure_srst_gpio(const struct adapter_gpio_config *srst_config)
-{
-	ch347_srst_active_high = !srst_config->active_low;
-
-	unsigned int gpio;
-	if (srst_config->gpio_num == ADAPTER_GPIO_NOT_SET) {
-		// the TRST pin is free in SWD mode, so use it by default
-		gpio = ch347.chip_variant == CH347F ? CH347F_TRST_GPIO : CH347T_TRST_GPIO;
-	} else {
-		gpio = srst_config->gpio_num;
-		if (gpio >= GPIO_CNT || (BIT(gpio) & ch347_usable_gpios()) == 0) {
-			LOG_ERROR("GPIO %u can't be used for SRST, disabling SRST", gpio);
-			ch347_srst_gpio_pin = 0xFF;
-			return;
-		}
-	}
-
-	/* Driving the same pin from two functions would let the LED activity
-		toggle the reset line, so refuse to share it. */
-	if (gpio == ch347_activity_led_gpio_pin) {
-		LOG_ERROR("GPIO %u is already used as the activity LED, disabling SRST", gpio);
-		ch347_srst_gpio_pin = 0xFF;
-		return;
-	}
-
-	ch347_srst_gpio_pin = gpio;
-}
-
-/**
  * @brief CH347 Initialization function
  *
  * @return ERROR_OK on success
@@ -1961,32 +2170,82 @@ static int ch347_init(void)
 		return retval;
 	}
 
-	LOG_DEBUG_IO("CH347 open success");
+	LOG_DEBUG("CH347 open success");
 
-	// CH347 JTAG init
-	ch347.tck_pin = TCK_L;
-	ch347.tms_pin = TMS_H;
+	if (swd_mode) {
+		/* Keep idle SWCLK and SWDIO state if CH347_CMD_JTAG_BIT_OP
+		 * is used for SRST handling */
+		ch347.tck_pin = TCK_H;
+		ch347.tms_pin = TMS_L;
+	} else {
+		ch347.tck_pin = TCK_L;
+		ch347.tms_pin = TMS_H;
+	}
 	ch347.tdi_pin = TDI_L;
 	ch347.trst_pin = TRST_H;
+	ch347.srst_pin = SRST_H;
+	ch347_dedicated_srst_enabled = false;
 	INIT_LIST_HEAD(&ch347.cmd_queue);
 	INIT_LIST_HEAD(&ch347.scan_queue);
 
-	ch347.pack_size = UNSET;
+	unsigned int gpios_used = 0;
+	const struct ch347_bit_op *gpio_to_bit_op = ch347.chip_variant == CH347F
+				? ch347f_gpio_to_bit_op : ch347t_gpio_to_bit_op;
 
-	ch347_configure_activity_led(&adapter_gpio_get_config()[ADAPTER_GPIO_IDX_LED]);
-
-	if (!swd_mode) {
-		tap_set_state(TAP_RESET);
-	} else {
-		ch347_configure_srst_gpio(&adapter_gpio_get_config()[ADAPTER_GPIO_IDX_SRST]);
-
-		retval = ch347_init_pack_size();
-		if (retval != ERROR_OK)
-			return retval;
-
-		retval = ch347_swd_init_cmd(1);
+	for (unsigned int i = 0; i < GPIO_CNT_EXT; i++) {
+		if (swd_mode ? gpio_to_bit_op[i].swd_use : gpio_to_bit_op[i].jtag_use)
+			gpios_used |= BIT(i);
 	}
-	return retval;
+
+	retval = ch347_check_gpio_unique(ADAPTER_GPIO_IDX_SRST, &gpios_used);
+	if (retval == ERROR_OK)
+		retval = ch347_check_gpio_unique(ADAPTER_GPIO_IDX_TRST, &gpios_used);
+	if (retval == ERROR_OK)
+		retval = ch347_check_gpio_unique(ADAPTER_GPIO_IDX_LED, &gpios_used);
+	if (retval != ERROR_OK)
+		return retval;
+
+	ch347.trst_default_gpio = ch347_trst_gpio();
+	if (gpios_used & BIT(ch347.trst_default_gpio))
+		ch347.trst_default_gpio = ADAPTER_GPIO_NOT_SET;
+
+	ch347.srst_default_gpio = ADAPTER_GPIO_NOT_SET;
+	if (ch347.chip_variant == CH347F
+			&& (gpios_used & BIT(CH347F_SRST_FAKE_GPIO)) == 0)
+		ch347.srst_default_gpio = CH347F_SRST_FAKE_GPIO;
+
+	/* Static initial pack_size is STANDARD_PACK (0), which would look already
+	 * probed. max_len stays 0 until the probe, and PIN_SET uses this queue. */
+	ch347.pack_size = UNSET;
+	retval = ch347_init_pack_size();
+	if (retval != ERROR_OK)
+		return retval;
+
+	uint8_t gpios[GPIO_CNT] = { 0 };
+	uint8_t bit_op = 0;
+	ch347_init_gpio(ADAPTER_GPIO_IDX_SRST, gpios, &bit_op);
+	ch347_init_gpio(ADAPTER_GPIO_IDX_TRST, gpios, &bit_op);
+	ch347_init_gpio(ADAPTER_GPIO_IDX_LED, gpios, &bit_op);
+
+	if (bit_op & SRST_H) {
+		retval = ch347_srst_enable();
+		if (retval != ERROR_OK) {
+			LOG_WARNING("CH347F dedicated SRST enable failed");
+			// Do not fail adapter init, partial functionality possible
+		}
+	}
+
+	retval = ch347_gpios_update(gpios, bit_op, true);
+	if (retval != ERROR_OK) {
+		LOG_WARNING("CH347 initial GPIO setting failed");
+		// Do not fail adapter init, partial functionality possible
+	}
+
+	if (swd_mode)
+		return ch347_swd_init_cmd(1);
+
+	tap_set_state(TAP_RESET);
+	return ERROR_OK;
 }
 
 /**
@@ -2003,11 +2262,8 @@ static int ch347_swd_init(void)
 	INIT_LIST_HEAD(&ch347_swd_context.send_cmd_head);
 	INIT_LIST_HEAD(&ch347_swd_context.free_cmd_head);
 
-	ch347_swd_context.queued_retval = ERROR_OK;
-	// 0XE8 + 2byte len + N byte cmds
-	ch347_swd_context.send_len = CH347_CMD_HEADER;
-	// 0XE8 + 2byte len + N byte ack + data
-	ch347_swd_context.need_recv_len = CH347_CMD_HEADER;
+	ch347_swd_context.send_len = 0;
+	ch347_swd_context.need_recv_len = 0;
 	struct ch347_swd_io *pswd_io = ch347_swd_context.ch347_cmd_buf;
 	for (int i = 0; i < CH347_MAX_CMD_BUF; i++, pswd_io++) {
 		INIT_LIST_HEAD(&pswd_io->list_entry);
@@ -2033,27 +2289,21 @@ static struct ch347_swd_io *ch347_get_one_swd_io(void)
 
 static int ch347_swd_queue_flush(void)
 {
-	int length = ch347_swd_context.send_len;
-	ch347_swd_context.send_buf[0] = CH347_CMD_SWD;
-	h_u16_to_le(&ch347_swd_context.send_buf[1], length - CH347_CMD_HEADER);
-	int retval = ch347_write_data(ch347_swd_context.send_buf, &length);
-	if (retval != ERROR_OK) {
-		ch347_swd_context.queued_retval = retval;
-		LOG_DEBUG("CH347WriteData error");
-		return retval;
-	}
-
 	ch347_swd_context.recv_len = 0;
-	length = ch347_swd_context.need_recv_len;
-	retval = ch347_read_data(&ch347_swd_context.recv_buf[ch347_swd_context.recv_len], &length);
+
+	int retval = ch347_cmd_start_next(CH347_CMD_SWD);
+	if (retval == ERROR_OK)
+		retval = ch347_scratchpad_add_bytes(ch347_swd_context.send_buf, ch347_swd_context.send_len);
 	if (retval != ERROR_OK) {
-		ch347_swd_context.queued_retval = retval;
-		LOG_DEBUG("CH347ReadData error");
+		ch347_queues_discard();
 		return retval;
 	}
 
-	ch347_swd_context.recv_len += length;
-	if (ch347_swd_context.need_recv_len > ch347_swd_context.recv_len) {
+	retval = ch347_cmd_transmit_queue();
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (ch347_swd_context.recv_len < ch347_swd_context.need_recv_len) {
 		LOG_ERROR("write/read failed %d %d",
 			  ch347_swd_context.recv_len,
 			  ch347_swd_context.need_recv_len);
@@ -2225,7 +2475,6 @@ static int ch347_swd_send_idle(uint32_t ap_delay_clk)
 			pswd_io = ch347_get_one_swd_io();
 			if (!pswd_io) {
 				LOG_ERROR("ch347 SWD queue not empty after ch347_swd_run_queue");
-				ch347_swd_context.queued_retval = ERROR_FAIL;
 				return ERROR_FAIL;
 			}
 		}
@@ -2249,35 +2498,20 @@ static int ch347_swd_send_idle(uint32_t ap_delay_clk)
 static int ch347_swd_run_queue_inner(void)
 {
 	LOG_DEBUG_IO("Executing %u queued transactions", ch347_swd_context.sent_cmd_count);
-	if (ch347_swd_context.queued_retval != ERROR_OK) {
-		LOG_DEBUG_IO("Skipping due to previous errors: %d", ch347_swd_context.queued_retval);
-		goto skip;
-	}
+
+	/* CMD_GPIO or CMD_JTAG_BIT_OP can take place before CMD_SWD
+	 * in the same USB packet */
+	if (!ch347.led_is_on)
+		ch347_activity_led_set(true, false);
 
 	int retval = ch347_swd_queue_flush();
-	if (retval != ERROR_OK)
-		return retval;
-
-	if (ch347_swd_context.queued_retval != ERROR_OK) {
-		LOG_ERROR("CH347 usb write/read failed - queued_retval");
+	if (retval != ERROR_OK) {
+		LOG_ERROR("CH347 usb write/read failed");
 		goto skip;
 	}
+
 	uint8_t *recv_buf = ch347_swd_context.recv_buf;
 	int recv_len = 0;
-	if (recv_buf[recv_len++] != CH347_CMD_SWD) { // 0XE8
-		ch347_swd_context.queued_retval = ERROR_FAIL;
-		LOG_ERROR("CH347 usb write/read failed - not CH347_CMD_SWD");
-		goto skip;
-	}
-
-	int cmds_len = le_to_h_u16(&recv_buf[recv_len]);
-	recv_len += 2; // cmds_len
-	if ((cmds_len + CH347_CMD_HEADER) > ch347_swd_context.recv_len) {
-		ch347_swd_context.queued_retval = ERROR_FAIL;
-		LOG_ERROR("CH347 usb write/read failed - too long");
-		goto skip;
-	}
-
 	struct list_head *tmp;
 	struct list_head *pos;
 	struct ch347_swd_io *pswd_io;
@@ -2286,8 +2520,8 @@ static int ch347_swd_run_queue_inner(void)
 		pswd_io = list_entry(pos, struct ch347_swd_io, list_entry);
 		if (pswd_io->usb_cmd == CH347_CMD_SWD_SEQ_W) {
 			if (recv_buf[recv_len++] != CH347_CMD_SWD_SEQ_W) {
-				ch347_swd_context.queued_retval = ERROR_FAIL;
 				LOG_ERROR("CH347 usb write/read failed - not CH347_CMD_SWD_SEQ_W");
+				retval = ERROR_FAIL;
 				goto skip;
 			}
 		} else { // read/write Reg
@@ -2315,21 +2549,21 @@ static int ch347_swd_run_queue_inner(void)
 									data);
 
 					if (ack != SWD_ACK_OK && check_ack) {
-						ch347_swd_context.queued_retval = swd_ack_to_error_code(ack);
+						retval = swd_ack_to_error_code(ack);
 						goto skip;
 					}
 
 					uint32_t parity = buf_get_u32(&recv_buf[recv_len], 32, 1);
 					if (parity != (uint32_t)parity_u32(data)) {
 						LOG_ERROR("SWD Read data parity mismatch");
-						ch347_swd_context.queued_retval = ERROR_FAIL;
+						retval = ERROR_SWD_FAIL;
 						goto skip;
 					}
 
 					if (pswd_io->dst)
 						*pswd_io->dst = data;
 				} else {
-					ch347_swd_context.queued_retval = ERROR_FAIL;
+					retval = ERROR_FAIL;
 					LOG_ERROR("CH347 usb write/read failed - not SWD_CMD_RNW");
 					goto skip;
 				}
@@ -2353,11 +2587,11 @@ static int ch347_swd_run_queue_inner(void)
 								 pswd_io->value);
 
 				if (ack != SWD_ACK_OK && check_ack) {
-					ch347_swd_context.queued_retval = swd_ack_to_error_code(ack);
+					retval = swd_ack_to_error_code(ack);
 					goto skip;
 				}
 			} else {
-				ch347_swd_context.queued_retval = ERROR_FAIL;
+				retval = ERROR_FAIL;
 				LOG_ERROR("CH347 usb write/read failed recv_len = %d", recv_len);
 				goto skip;
 			}
@@ -2377,15 +2611,11 @@ skip:
 		}
 	}
 
-	// 0xE8 + 2byte len
-	ch347_swd_context.send_len = CH347_CMD_HEADER;
-	// 0xE8 + 2byte len
-	ch347_swd_context.need_recv_len = CH347_CMD_HEADER;
+	ch347_swd_context.send_len = 0;
+	ch347_swd_context.need_recv_len = 0;
 	ch347_swd_context.recv_len = 0;
 	ch347_swd_context.sent_cmd_count = 0;
 	ch347_swd_context.total_swd_clk = 0;
-	retval = ch347_swd_context.queued_retval;
-	ch347_swd_context.queued_retval = ERROR_OK;
 	return retval;
 }
 
@@ -2397,7 +2627,14 @@ static int ch347_swd_run_queue(void)
 	if (retval != ERROR_OK)
 		return retval;
 
-	return ch347_swd_run_queue_inner();
+	retval = ch347_swd_run_queue_inner();
+
+	/* CMD_GPIO or CMD_JTAG_BIT_OP cannot follow CMD_SWD in the same
+	 * USB packet. Flush the queue first then send eventual LED off
+	 * in a separate USB packet */
+	ch347_activity_led_set(false, true);
+
+	return retval;
 }
 
 static int ch347_swd_queue_cmd(uint8_t cmd, uint32_t *dst, uint32_t data, uint32_t ap_delay_clk)
@@ -2433,7 +2670,6 @@ static int ch347_swd_queue_cmd(uint8_t cmd, uint32_t *dst, uint32_t data, uint32
 		pswd_io = ch347_get_one_swd_io();
 		if (!pswd_io) {
 			LOG_ERROR("ch347 SWD queue not empty after ch347_swd_run_queue");
-			ch347_swd_context.queued_retval = ERROR_FAIL;
 			return ERROR_FAIL;
 		}
 	}

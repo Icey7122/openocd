@@ -798,17 +798,30 @@ int target_run_algorithm(struct target *target,
 		retval = ERROR_TARGET_NOT_EXAMINED;
 		goto done;
 	}
-	if (!target->type->run_algorithm) {
+	if (!target->type->run_algorithm &&
+			!(target->type->start_algorithm && target->type->wait_algorithm)) {
 		LOG_ERROR("Target type '%s' does not support %s",
 				target_type_name(target), __func__);
 		goto done;
 	}
 
 	target->running_alg = true;
-	retval = target->type->run_algorithm(target,
-			num_mem_params, mem_params,
-			num_reg_params, reg_param,
-			entry_point, exit_point, timeout_ms, arch_info);
+	if (target->type->run_algorithm) {
+		retval = target->type->run_algorithm(target,
+				num_mem_params, mem_params,
+				num_reg_params, reg_param,
+				entry_point, exit_point, timeout_ms, arch_info);
+	} else {
+		retval = target->type->start_algorithm(target,
+				num_mem_params, mem_params,
+				num_reg_params, reg_param,
+				entry_point, exit_point, arch_info);
+		if (retval == ERROR_OK)
+			retval = target->type->wait_algorithm(target,
+					num_mem_params, mem_params,
+					num_reg_params, reg_param,
+					exit_point, timeout_ms, arch_info);
+	}
 	target->running_alg = false;
 
 done:
@@ -3659,6 +3672,10 @@ COMMAND_HANDLER(handle_load_image_command)
 	image_size = 0x0;
 	retval = ERROR_OK;
 	for (unsigned int i = 0; i < image.num_sections; i++) {
+		retval = CALL_COMMAND_HANDLER(detect_breakpoints_in_section, target, image.sections[i]);
+		if (retval != ERROR_OK)
+			return retval;
+
 		buffer = malloc(image.sections[i].size);
 		if (!buffer) {
 			command_print(CMD,
@@ -6370,8 +6387,19 @@ COMMAND_HANDLER(handle_fast_load_command)
 	int64_t ms = timeval_ms();
 	int size = 0;
 	int retval = ERROR_OK;
+
+	struct target *target = get_current_target(CMD_CTX);
 	for (i = 0; i < fastload_num; i++) {
-		struct target *target = get_current_target(CMD_CTX);
+		struct imagesection section = {
+			.base_address = fastload[i].address,
+			.size = fastload[i].length,
+		};
+		retval = CALL_COMMAND_HANDLER(detect_breakpoints_in_section, target, section);
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	for (i = 0; i < fastload_num; i++) {
 		command_print(CMD, "Write to 0x%08x, length 0x%08x",
 					  (unsigned int)(fastload[i].address),
 					  (unsigned int)(fastload[i].length));

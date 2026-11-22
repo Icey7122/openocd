@@ -57,8 +57,17 @@
 #include <jtag/interface.h>
 #include <jtag/commands.h>
 
+#if BUILD_LINUXGPIOD
+#include "linuxgpiod.h"
+#endif
+
 // Number of bits per SPI exchange
 #define SPI_BITS 8
+
+/* Some transactions such as the JTAG to SWD transitions take extra space.
+ * Ensure queue buffers are always large enough to guarantee that these
+ * transactions can occur */
+#define MIN_QUEUE_BYTES 64
 
 // Time in uS after the last bit of transfer before deselecting the device
 #define SPI_DESELECT_DELAY 0
@@ -251,6 +260,11 @@ static int spidev_alloc_queue(unsigned int new_queue_entries)
 
 	unsigned int new_queue_buf_size =
 		(new_queue_entries * (SWD_OP_BYTES + AP_DELAY_BYTES)) + END_IDLE_BYTES;
+	if (new_queue_buf_size < MIN_QUEUE_BYTES) {
+		LOG_INFO("Increasing queue buffer size from %u to minimum %u bytes",
+			new_queue_buf_size, MIN_QUEUE_BYTES);
+		new_queue_buf_size = MIN_QUEUE_BYTES;
+	}
 
 	queue_infos = realloc(queue_infos, sizeof(struct queue_info) * new_queue_entries);
 	if (!queue_infos)
@@ -296,6 +310,13 @@ static int spidev_init(void)
 		return ERROR_JTAG_INIT_FAILED;
 	}
 
+	int ret;
+#if BUILD_LINUXGPIOD
+	ret = linuxgpiod_helper_get_line(ADAPTER_GPIO_IDX_SRST);
+	if (ret != ERROR_OK)
+		goto out_error;
+#endif
+
 	// Open SPI device.
 	spi_fd = open(spi_path, O_RDWR);
 	if (spi_fd < 0) {
@@ -303,7 +324,6 @@ static int spidev_init(void)
 		goto out_error;
 	}
 
-	int ret;
 	// Set SPI mode.
 #ifdef SPI_IOC_WR_MODE32
 	ret = ioctl(spi_fd, SPI_IOC_WR_MODE32, &spi_mode);
@@ -350,6 +370,10 @@ out_error:
 static int spidev_quit(void)
 {
 	spidev_free_queue();
+
+#if BUILD_LINUXGPIOD
+	linuxgpiod_quit();
+#endif
 
 	if (spi_fd < 0)
 		return ERROR_OK;
@@ -637,6 +661,9 @@ struct adapter_driver linuxspidev_adapter_driver = {
 	.speed = spidev_speed,
 	.khz = spidev_khz,
 	.speed_div = spidev_speed_div,
+#if BUILD_LINUXGPIOD
+	.reset = linuxgpiod_reset,
+#endif
 
 	.swd_ops = &spidev_swd,
 };

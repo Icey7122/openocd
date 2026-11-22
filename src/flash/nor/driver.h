@@ -88,6 +88,9 @@ struct flash_driver {
 	 * called, the flash driver should erase the specified sectors
 	 * using whatever means are at its disposal.
 	 *
+	 * If the memory is a non-volatile RAM or other type which
+	 * does not need to be erased before write, set method to NULL.
+	 *
 	 * @param bank The bank of flash to be erased.
 	 * @param first The number of the first sector to erase, typically 0.
 	 * @param last The number of the last sector to erase, typically N-1.
@@ -298,6 +301,7 @@ extern const struct flash_driver niietcm4_flash;
 extern const struct flash_driver npcx_flash;
 extern const struct flash_driver nrf51_flash;
 extern const struct flash_driver nrf5_flash;
+extern const struct flash_driver nrf54_flash;
 extern const struct flash_driver numicro_flash;
 extern const struct flash_driver ocl_flash;
 extern const struct flash_driver pac55xx_flash;
@@ -316,6 +320,7 @@ extern const struct flash_driver rsl10_flash;
 extern const struct flash_driver sh_qspi_flash;
 extern const struct flash_driver sim3x_flash;
 extern const struct flash_driver stellaris_flash;
+extern const struct flash_driver stldr_flash;
 extern const struct flash_driver stm32f1x_flash;
 extern const struct flash_driver stm32f2x_flash;
 extern const struct flash_driver stm32h7x_flash;

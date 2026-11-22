@@ -178,7 +178,6 @@ COMMAND_HANDLER(handle_flash_probe_command)
 
 COMMAND_HANDLER(handle_flash_erase_check_command)
 {
-	bool blank = true;
 	if (CMD_ARGC != 1)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
@@ -187,20 +186,28 @@ COMMAND_HANDLER(handle_flash_erase_check_command)
 	if (retval != ERROR_OK)
 		return retval;
 
+	struct duration bench;
+	duration_start(&bench);
+
 	if (p->driver->erase_check)
 		retval = p->driver->erase_check(p);
 	else
 		retval = default_flash_blank_check(p);
-	if (retval == ERROR_OK) {
-		command_print(CMD, "successfully checked erase state");
-	} else {
+
+	if (retval != ERROR_OK) {
 		command_print(CMD,
-			"Error: checking erase state of flash bank #%s at "
-			TARGET_ADDR_FMT,
+			"checking erase state of flash bank #%s at "
+			TARGET_ADDR_FMT " failed",
 			CMD_ARGV[0],
 			p->base);
+		return retval;
 	}
 
+	if (duration_measure(&bench) == ERROR_OK)
+		command_print(CMD, "checked erase state in %fs (%0.3f KiB/s)",
+			duration_elapsed(&bench), duration_kbps(&bench, p->size));
+
+	bool blank = true;
 	for (unsigned int j = 0; j < p->num_sectors; j++) {
 		char *erase_state;
 
@@ -220,6 +227,9 @@ COMMAND_HANDLER(handle_flash_erase_check_command)
 			p->sectors[j].size >> 10,
 			erase_state);
 	}
+
+	if (p->num_sectors == 0)
+		blank = (p->is_erased == 1);
 
 	if (blank)
 		command_print(CMD, "\tBank is erased");
@@ -276,15 +286,24 @@ COMMAND_HANDLER(handle_flash_erase_address_command)
 		retval = flash_unlock_address_range(target, address, length);
 
 	if (retval == ERROR_OK)
-		retval = flash_erase_address_range(target, do_pad, address, length);
+		retval = flash_erase_address_range(target, do_pad, address, length,
+										false /* skip_banks_without_erase */);
 
-	if (retval == ERROR_OK && duration_measure(&bench) == ERROR_OK) {
+	if (retval == ERROR_FLASH_OPER_UNSUPPORTED) {
+		command_print(CMD, "erase operation is not supported");
+		return retval;
+	} else if (retval != ERROR_OK) {
+		command_print(CMD, "erase operation failed");
+		return retval;
+	}
+
+	if (duration_measure(&bench) == ERROR_OK) {
 		command_print(CMD, "erased address " TARGET_ADDR_FMT " (length %" PRIu32 ")"
 			" in %fs (%0.3f KiB/s)", address, length,
 			duration_elapsed(&bench), duration_kbps(&bench, length));
 	}
 
-	return retval;
+	return ERROR_OK;
 }
 
 COMMAND_HANDLER(handle_flash_erase_command)
@@ -302,23 +321,29 @@ COMMAND_HANDLER(handle_flash_erase_command)
 	if (retval != ERROR_OK)
 		return retval;
 
-	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], first);
-	if (strcmp(CMD_ARGV[2], "last") == 0)
-		last = p->num_sectors - 1;
-	else
-		COMMAND_PARSE_NUMBER(u32, CMD_ARGV[2], last);
+	if (p->num_sectors == 0) {
+		LOG_INFO("bank has no sectors, ignoring specified sectors");
+		first = 0;
+		last = 0;
+	} else {
+		COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], first);
+		if (strcmp(CMD_ARGV[2], "last") == 0)
+			last = p->num_sectors - 1;
+		else
+			COMMAND_PARSE_NUMBER(u32, CMD_ARGV[2], last);
 
-	if (!(first <= last)) {
-		command_print(CMD, "ERROR: "
-			"first sector must be <= last");
-		return ERROR_FAIL;
-	}
+		if (!(first <= last)) {
+			command_print(CMD, "ERROR: "
+				"first sector must be <= last");
+			return ERROR_FAIL;
+		}
 
-	if (!(last <= (p->num_sectors - 1))) {
-		command_print(CMD, "ERROR: "
-			"last sector must be <= %u",
-			p->num_sectors - 1);
-		return ERROR_FAIL;
+		if (!(last <= (p->num_sectors - 1))) {
+			command_print(CMD, "ERROR: "
+				"last sector must be <= %u",
+				p->num_sectors - 1);
+			return ERROR_FAIL;
+		}
 	}
 
 	struct duration bench;
@@ -326,13 +351,21 @@ COMMAND_HANDLER(handle_flash_erase_command)
 
 	retval = flash_driver_erase(p, first, last);
 
-	if (retval == ERROR_OK && duration_measure(&bench) == ERROR_OK) {
+	if (retval == ERROR_FLASH_OPER_UNSUPPORTED) {
+		command_print(CMD, "erase operation is not supported");
+		return retval;
+	} else if (retval != ERROR_OK) {
+		command_print(CMD, "failed to erase sectors");
+		return retval;
+	}
+
+	if (duration_measure(&bench) == ERROR_OK) {
 		command_print(CMD, "erased sectors %" PRIu32 " "
 			"through %" PRIu32 " on flash bank %u "
 			"in %fs", first, last, p->bank_number, duration_elapsed(&bench));
 	}
 
-	return retval;
+	return ERROR_OK;
 }
 
 COMMAND_HANDLER(handle_flash_protect_command)
@@ -381,15 +414,18 @@ COMMAND_HANDLER(handle_flash_protect_command)
 	}
 
 	retval = flash_driver_protect(p, set, first, last);
-	if (retval == ERROR_OK) {
-		command_print(CMD, "%s protection for %s %" PRIu32
-			" through %" PRIu32 " on flash bank %d",
-			(set) ? "set" : "cleared",
-			(p->num_prot_blocks) ? "blocks" : "sectors",
-			first, last, p->bank_number);
+	if (retval != ERROR_OK) {
+		command_print(CMD, "failed to %s protection", set ? "set" : "clear");
+		return retval;
 	}
 
-	return retval;
+	command_print(CMD, "%s protection for %s %" PRIu32
+		" through %" PRIu32 " on flash bank %d",
+		set ? "set" : "cleared",
+		p->num_prot_blocks ? "blocks" : "sectors",
+		first, last, p->bank_number);
+
+	return ERROR_OK;
 }
 
 COMMAND_HANDLER(handle_flash_write_image_command)
@@ -581,10 +617,10 @@ COMMAND_HANDLER(handle_flash_fill_command)
 
 	if (padding_at_start) {
 		memset(buffer, bank->default_padded_value, padding_at_start);
-		LOG_WARNING("Start address " TARGET_ADDR_FMT
+		LOG_INFO("Start address " TARGET_ADDR_FMT
 			" breaks the required alignment of flash bank %s",
 			address, bank->name);
-		LOG_WARNING("Padding %" PRIu32 " bytes from " TARGET_ADDR_FMT,
+		LOG_INFO("Padding %" PRIu32 " bytes from " TARGET_ADDR_FMT,
 		    padding_at_start, aligned_start);
 	}
 
@@ -919,10 +955,10 @@ COMMAND_HANDLER(handle_flash_write_bank_command)
 
 	if (padding_at_start) {
 		memset(buffer, bank->default_padded_value, padding_at_start);
-		LOG_WARNING("Start offset 0x%08" PRIx32
+		LOG_INFO("Start offset 0x%08" PRIx32
 			" breaks the required alignment of flash bank %s",
 			offset, bank->name);
-		LOG_WARNING("Padding %" PRIu32 " bytes from " TARGET_ADDR_FMT,
+		LOG_INFO("Padding %" PRIu32 " bytes from " TARGET_ADDR_FMT,
 		    padding_at_start, aligned_start);
 	}
 
@@ -1201,21 +1237,21 @@ static const struct command_registration flash_exec_command_handlers[] = {
 		.name = "probe",
 		.handler = handle_flash_probe_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id",
+		.usage = "(bank_name|num)",
 		.help = "Identify a flash bank.",
 	},
 	{
 		.name = "info",
 		.handler = handle_flash_info_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id ['sectors']",
+		.usage = "(bank_name|num) ['sectors']",
 		.help = "Print information about a flash bank.",
 	},
 	{
 		.name = "erase_check",
 		.handler = handle_flash_erase_check_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id",
+		.usage = "(bank_name|num)",
 		.help = "Check erase state of all blocks in a "
 			"flash bank.",
 	},
@@ -1223,7 +1259,7 @@ static const struct command_registration flash_exec_command_handlers[] = {
 		.name = "erase_sector",
 		.handler = handle_flash_erase_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id first_sector_num (last_sector_num|'last')",
+		.usage = "(bank_name|num) first_sector_num (last_sector_num|'last')",
 		.help = "Erase a range of sectors in a flash bank.",
 	},
 	{
@@ -1329,7 +1365,7 @@ static const struct command_registration flash_exec_command_handlers[] = {
 		.name = "read_bank",
 		.handler = handle_flash_read_bank_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id filename [offset [length]]",
+		.usage = "(bank_name|num) filename [offset [length]]",
 		.help = "Read binary data from flash bank to file. Allow optional "
 			"offset from beginning of the bank (defaults to zero).",
 	},
@@ -1337,7 +1373,7 @@ static const struct command_registration flash_exec_command_handlers[] = {
 		.name = "verify_bank",
 		.handler = handle_flash_verify_bank_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id filename [offset]",
+		.usage = "(bank_name|num) filename [offset]",
 		.help = "Compare the contents of a file with the contents of the "
 			"flash bank. Allow optional offset from beginning of the bank "
 			"(defaults to zero).",
@@ -1346,7 +1382,7 @@ static const struct command_registration flash_exec_command_handlers[] = {
 		.name = "protect",
 		.handler = handle_flash_protect_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id first_block [last_block|'last'] "
+		.usage = "(bank_name|num) first_block [last_block|'last'] "
 			"('on'|'off')",
 		.help = "Turn protection on or off for a range of protection "
 			"blocks or sectors in a given flash bank. "
@@ -1356,7 +1392,7 @@ static const struct command_registration flash_exec_command_handlers[] = {
 		.name = "padded_value",
 		.handler = handle_flash_padded_value_command,
 		.mode = COMMAND_EXEC,
-		.usage = "bank_id value",
+		.usage = "(bank_name|num) value",
 		.help = "Set default flash padded value",
 	},
 	COMMAND_REGISTRATION_DONE
@@ -1499,7 +1535,7 @@ static const struct command_registration flash_config_command_handlers[] = {
 		.name = "bank",
 		.handler = handle_flash_bank_command,
 		.mode = COMMAND_CONFIG,
-		.usage = "bank_id driver_name base_address size_bytes "
+		.usage = "bank_name driver_name base_address size_bytes "
 			"chip_width_bytes bus_width_bytes target "
 			"[driver_options ...]",
 		.help = "Define a new bank with the given name, "

@@ -1441,6 +1441,7 @@ The most complex task of a board config file is creating such a
 Define those handlers last, after you verify the rest of the board
 configuration works.
 
+@anchor{multipletargetconfig}
 @subsection Communication Between Config files
 
 In addition to target-specific utility code, another way that
@@ -2617,27 +2618,86 @@ mitigates the problem.
 
 The driver supports activity LED through the generic
 command @ref{adapter gpio, @command{adapter gpio led}}.
+Also SRST and TRST signals can be configured as
+@ref{adapter gpio, @command{adapter gpio srst|trst}}.
 
-In SWD mode the TRST pin is not needed as a JTAG signal, so the driver drives
-it as a GPIO to provide SRST. TRST is pin 9 on both chips, but has a different
-GPIO number: GPIO5 on the CH347T and GPIO3 on the CH347F. Use
-@ref{adapter gpio, @command{adapter gpio srst}} to select a different GPIO or
-to change the polarity. SRST is not available in JTAG mode, where the pin
-carries TRST.
+@b{CH347T} mode 3 @b{GPIOs:}
+@multitable @columnfractions .1 .08 .12 .7
+@item @b{GPIO} @tab @b{pin#} @tab @b{function} @tab @b{note}
+@item GPIO0 @tab 6 @tab TCK
+	@tab Fixed function in JTAG and SWD, do not reconfigure
+@item GPIO1 @tab 7 @tab TDO
+	@tab Can be configured in SWD mode
+@item GPIO2 @tab 5 @tab TMS
+	@tab Fixed function in JTAG and SWD, do not reconfigure
+@item GPIO3 @tab 11 @tab -
+	@tab Free GPIO, can be configured
+@item GPIO4 @tab 15 @tab ACT
+	@tab USB connected active low, usually LED connected, can be reconfigured
+@item GPIO5 @tab 9 @tab TRST
+	@tab TRST by default, can be reconfigured
+@item GPIO6 @tab 2 @tab CTS1
+	@tab Can be reconfigured, may be readable from UART1
+@item GPIO7 @tab 13 @tab RTS1
+	@tab With boot time sampling, can be reconfigured if UART1 is not used
+@end multitable
 
-Not every GPIO can be used, because the GPIO's share their pins with the
-interface signals. Only GPIO3 to GPIO6 are free on the CH347T, and GPIO0 to
-GPIO3 on the CH347F, where GPIO4 to GPIO7 are TCK, TDO, TDI and TMS. Note that
-GPIO3 of the CH347F is TRST, so it is only free when TRST is unused.
+@b{CH347F GPIOs:}
+@multitable @columnfractions .1 .08 .12 .7
+@item @b{GPIO} @tab @b{pin#} @tab @b{function} @tab @b{note}
+@item GPIO0 @tab 17 @tab CTS0
+	@tab Can be reconfigured, pin may be readable from UART0
+@item GPIO1 @tab 18 @tab RTS0
+	@tab With boot time sampling, can be configured if UART0 is not used
+@item GPIO2 @tab 10 @tab DTR0
+	@tab With boot time sampling, can be configured if UART0 is not used
+@item GPIO3 @tab 9 @tab TRST
+	@tab TRST by default, can be reconfigured
+@item GPIO4 @tab 23 @tab TCK
+	@tab Fixed function in JTAG and SWD, do not reconfigure
+@item GPIO5 @tab 24 @tab TDO
+	@tab Can be configured in SWD mode
+@item GPIO6 @tab 25 @tab TDI
+	@tab Can be configured in SWD mode
+@item GPIO7 @tab 26 @tab TMS
+	@tab Fixed function in JTAG and SWD, do not reconfigure
+@item @tab @tab @tab
+@item SRST @tab 8 @tab ACT
+	@tab USB connected active low function after CH347F power up,
+LED connected on CH347F EV board.
+	@* SRST in OpenOCD by default, can be reconfigured as gpio 8, push-pull only.
+	@* @b{Warning:} CH347F drives the pin low since USB bus initialisation
+and holds a wired target in reset until reconfigured by OpenOCD.
+@end multitable
 
-SRST and the activity LED cannot share a GPIO. If both are assigned to the
-same pin, SRST gets disabled.
+The real GPIOs (not CH347F dedicated SRST pin, aliased as gpio 8) configured
+for SRST and TRST signals follow the drive mode of
+@ref{reset_config,,@command{reset_config}}.
 
-The SRST GPIO follows the drive mode of @ref{reset_config,,@command{reset_config}}.
-The default is open drain, which the driver emulates by switching the pin to an
-input instead of driving it to the inactive level, so the reset line needs a
-pull-up. Use @command{reset_config srst_push_pull} if it has none.
+CH347T in SWD mode with activity LED and SRST signal on TRST pin:
+@example
+adapter gpio srst 5
+adapter gpio led 4 -active-low -exit-active
+@end example
 
+CH347T in any mode with default TRST and SRST on GPIO 6 pin:
+@example
+adapter gpio srst 6
+@end example
+
+CH347F in any mode with crossed TRST and SRST, TRST pin is open-drain capable
+therefore more suitable for SRST signal:
+@example
+adapter gpio srst 3
+adapter gpio trst 8
+@end example
+
+CH347F evaluation board in any mode with activity LED, default TRST and
+SRST moved to GPIO0:
+@example
+adapter gpio srst 0
+adapter gpio led 8 -active-low -exit-active
+@end example
 @end deffn
 
 @deffn {Interface Driver} {cklink}
@@ -3601,6 +3661,9 @@ target requests a wait as all queued transactions will need to be exchanged
 before spidev can see the wait request.
 @end deffn
 
+If built with linuxgpiod driver, optional SRST signal can be configured
+with generic command @ref{adapter gpio, @command{adapter gpio}}.
+
 See @file{tcl/interface/spidev_example.cfg} for a sample configuration file.
 
 Electrical connections:
@@ -3911,6 +3974,7 @@ protected using other SoC mechanisms.
 Set the emulated address and address window size. Both of these
 parameters must be aligned to page size.
 @end deffn
+@end deffn
 
 @deffn {Interface Driver} {rshim}
 
@@ -3940,7 +4004,6 @@ Example configuration:
 xvc host 192.168.3.192
 xvc port 5000
 @end example
-@end deffn
 
 @deffn {Config Command} {xvc host} @var{hostname}
 Specifies the hostname of the remote debugger or UNIX socket to connect to.
@@ -4097,15 +4160,21 @@ instead of @command{adapter speed}, but only for (ARM) cores and boards
 which support adaptive clocking.
 
 @deffn {Command} {adapter speed} max_speed_kHz
-A non-zero speed is in KHZ. Hence: 3000 is 3mhz.
-JTAG interfaces usually support a limited number of
+A non-zero speed is in kHz. Hence: 3000 is 3 MHz.
+The debug adapter usually supports a limited number of
 speeds. The speed actually used won't be faster
 than the speed specified.
 
-Chip data sheets generally include a top JTAG clock rate.
-The actual rate is often a function of a CPU core clock,
+Chip data sheets generally include a top debug clock rate.
+It might be further lowered by PCB routing or wiring in case
+of an external adapter.
+
+The actual rate is sometimes a function of a CPU core clock,
 and is normally less than that peak rate.
-For example, most ARM cores accept at most one sixth of the CPU clock.
+For example, the legacy ARM7, ARM9, ARM11 cores accept JTAG clock
+at most one sixth of the CPU clock.
+Note the modern ARM ADI v5+ based debug circuitry is always self-clocked
+and the debug clock frequency can be much higher than CPU clock.
 
 Speed 0 (khz) selects RTCK method.
 @xref{faqrtck,,FAQ RTCK}.
@@ -4123,7 +4192,7 @@ This Tcl proc (defined in @file{startup.tcl}) attempts to enable RTCK/RCLK.
 If that fails (maybe the interface, board, or target doesn't
 support it), falls back to the specified frequency.
 @example
-# Fall back to 3mhz if RTCK is not supported
+# Fall back to 3 MHz if RTCK is not supported
 jtag_rclk 3000
 @end example
 @end defun
@@ -5954,7 +6023,7 @@ board by (re)installing working boot firmware.
 @section Flash Configuration Commands
 @cindex flash configuration
 
-@deffn {Config Command} {flash bank} name driver base size chip_width bus_width target [driver_options]
+@deffn {Config Command} {flash bank} bank_name driver base size chip_width bus_width target [driver_options]
 Configures a flash bank which provides persistent storage
 for addresses from @math{base} to @math{base + size - 1}.
 These banks will often be visible to GDB through the target's memory map.
@@ -5962,8 +6031,8 @@ In some cases, configuring a flash bank will activate extra commands;
 see the driver-specific documentation.
 
 @itemize @bullet
-@item @var{name} ... may be used to reference the flash bank
-in other flash commands. A number is also available.
+@item @var{bank_name} ... may be used to reference the flash bank
+in other flash commands.
 @item @var{driver} ... identifies the controller driver
 associated with the flash bank being declared.
 This is usually @code{cfi} for external flash, or else
@@ -6003,14 +6072,35 @@ declared using @command{flash bank}, numbered from zero.
 This returned list can be manipulated easily from within scripts.
 @end deffn
 
-@deffn {Command} {flash probe} num
-Identify the flash, or validate the parameters of the configured flash. Operation
-depends on the flash type.
-The @var{num} parameter is a value shown by @command{flash banks}.
-Most flash commands will implicitly @emph{autoprobe} the bank;
-flash drivers can distinguish between probing and autoprobing,
-but most don't bother.
+@deffn {Command} {flash probe} (bank_name|num)
+Identify the flash, or validate the parameters of the configured flash.
+Operation depends on the flash type.
+Most flash commands will implicitly @emph{autoprobe} the bank
+if has not been probed.
+On the other hand @command{flash probe} should clear the values remembered
+from the pervious probe and start over identifying and validating.
+Specify the bank by the full @var{bank_name}.
+Alternatively use the @var{num} parameter, see details below.
 @end deffn
+
+@anchor{flashbanknamenum}
+@section Specifying NOR and NAND Flash Banks
+Lot of flash/nand commands and driver specific commands use
+the first parameter @var{(bank_name|num)} to select
+a flash bank. The simplified @var{bank_id} in the driver specific
+commands description has the same meaning.
+@var{bank_name} is the name given in @command{flash bank} configuration
+command.
+Alternatively select a bank by @var{num}, the index shown by
+@command{flash banks} or @command{nand list}, or a zero based
+index of a @command{flash list} item.
+Use the @var{num} form as a shortcut in manually issued commands.
+
+In Tcl scripts, mainly in target config files, strongly prefer
+the full @var{bank_name} form. Be aware @var{num} gets renumbered
+when more than one target configuration is used to debug
+multiple SoCs on one JTAG chain or using multidrop SWD.
+@xref{multipletargetconfig,,Communication Between Config files}.
 
 @section Preparing a Target before Flash Programming
 
@@ -6065,13 +6155,12 @@ Examples include CFI flash such as ``Intel Advanced Bootblock flash'',
 and AT91SAM7 on-chip flash.
 @xref{flashprotect,,flash protect}.
 
-@deffn {Command} {flash erase_sector} num first last
-Erase sectors in bank @var{num}, starting at sector @var{first}
-up to and including @var{last}.
+@deffn {Command} {flash erase_sector} (bank_name|num) first last
+Erase sectors in bank @var{bank_name} or in bank with @var{num} index,
+starting at sector @var{first} up to and including @var{last}.
 Sector numbering starts at 0.
 Providing a @var{last} sector of @option{last}
 specifies "to the end of the flash bank".
-The @var{num} parameter is a value shown by @command{flash banks}.
 @end deffn
 
 @deffn {Command} {flash erase_address} [@option{pad}] [@option{unlock}] address length
@@ -6136,26 +6225,27 @@ flash read_memory 0x08000000 32 2
 @end example
 @end deffn
 
-@deffn {Command} {flash write_bank} num filename [offset]
-Write the binary @file{filename} to flash bank @var{num},
+@deffn {Command} {flash write_bank} (bank_name|num) filename [offset]
+Write the binary @file{filename} to flash bank @var{bank_name}
+or bank with @var{num} index,
 starting at @var{offset} bytes from the beginning of the bank. If @var{offset}
 is omitted, start at the beginning of the flash bank.
 The @var{num} parameter is a value shown by @command{flash banks}.
 @end deffn
 
-@deffn {Command} {flash read_bank} num filename [offset [length]]
-Read @var{length} bytes from the flash bank @var{num} starting at @var{offset}
+@deffn {Command} {flash read_bank} (bank_name|num) filename [offset [length]]
+Read @var{length} bytes from the flash bank @var{bank_name}
+or bank with @var{num} index, starting at @var{offset}
 and write the contents to the binary @file{filename}. If @var{offset} is
 omitted, start at the beginning of the flash bank. If @var{length} is omitted,
 read the remaining bytes from the flash bank.
-The @var{num} parameter is a value shown by @command{flash banks}.
 @end deffn
 
-@deffn {Command} {flash verify_bank} num filename [offset]
+@deffn {Command} {flash verify_bank} (bank_name|num) filename [offset]
 Compare the contents of the binary file @var{filename} with the contents of the
-flash bank @var{num} starting at @var{offset}. If @var{offset} is omitted,
+flash bank @var{bank_name}or bank with @var{num} index,
+starting at @var{offset}. If @var{offset} is omitted,
 start at the beginning of the flash bank. Fail if the contents do not match.
-The @var{num} parameter is a value shown by @command{flash banks}.
 @end deffn
 
 @deffn {Command} {flash write_image} [erase] [unlock] filename [offset] [type]
@@ -6168,7 +6258,9 @@ explicitly as @option{bin} (binary), @option{ihex} (Intel hex),
 @option{elf} (ELF file), @option{s19} (Motorola s19).
 @option{mem}, or @option{builder}.
 The relevant flash sectors will be erased prior to programming
-if the @option{erase} parameter is given. If @option{unlock} is
+if the @option{erase} parameter is given. @option{erase}
+is silently ignored for banks without erase support.
+If @option{unlock} is
 provided, then the flash banks are unlocked before erase and
 program. The flash bank to use is inferred from the address of
 each image section.
@@ -6210,35 +6302,34 @@ check for successful programming.
 @section Other Flash commands
 @cindex flash protection
 
-@deffn {Command} {flash erase_check} num
-Check erase state of sectors in flash bank @var{num},
-and display that status.
-The @var{num} parameter is a value shown by @command{flash banks}.
+@deffn {Command} {flash erase_check} (bank_name|num)
+Check erase state of sectors in flash @var{bank_name} or bank with
+@var{num} index and display that status.
 @end deffn
 
-@deffn {Command} {flash info} num [sectors]
-Print info about flash bank @var{num}, a list of protection blocks
-and their status. Use @option{sectors} to show a list of sectors instead.
+@deffn {Command} {flash info} (bank_name|num) [sectors]
+Print info about flash bank @var{bank_name} or bank with @var{num}
+index, a list of protection blocks and their status.
+Use @option{sectors} to show a list of sectors instead.
 
-The @var{num} parameter is a value shown by @command{flash banks}.
 This command will first query the hardware, it does not print cached
 and possibly stale information.
 @end deffn
 
 @anchor{flashprotect}
-@deffn {Command} {flash protect} num first last (@option{on}|@option{off})
+@deffn {Command} {flash protect} (bank_name|num) first last (@option{on}|@option{off})
 Enable (@option{on}) or disable (@option{off}) protection of flash blocks
-in flash bank @var{num}, starting at protection block @var{first}
+in flash bank @var{bank_name} or bank with @var{num} index,
+starting at protection block @var{first}
 and continuing up to and including @var{last}.
 Providing a @var{last} block of @option{last}
 specifies "to the end of the flash bank".
-The @var{num} parameter is a value shown by @command{flash banks}.
 The protection block is usually identical to a flash sector.
 Some devices may utilize a protection block distinct from flash sector.
 See @command{flash info} for a list of protection blocks.
 @end deffn
 
-@deffn {Command} {flash padded_value} num value
+@deffn {Command} {flash padded_value} (bank_name|num) value
 Sets the default value used for padding any image sections, This should
 normally match the flash bank erased value. If not specified by this
 command or the flash driver then it defaults to 0xff.
@@ -7574,11 +7665,11 @@ command completes.
 @end deffn
 
 @deffn {Command} {kinetis nvm_partition}
-For FlexNVM devices only (KxxDX and KxxFX).
-Not supported (yet) on S32K1 devices.
+For FlexNVM devices only (KxxDX, KxxFX and S32K1xx).
 Command shows or sets data flash or EEPROM backup size in kilobytes,
-sets two EEPROM blocks sizes in bytes and enables/disables loading
-of EEPROM contents to FlexRAM during reset.
+sets two EEPROM blocks sizes in bytes, enables/disables loading
+of EEPROM contents to FlexRAM during reset and, on S32K1xx devices with
+CSEc, sets the number of CSEc keys (0, 5, 10 or 20).
 
 For details see device reference manual, Flash Memory Module,
 Program Partition command.
@@ -7601,6 +7692,22 @@ Set 16 KB EEPROM backup, rest of FlexNVM is a data flash. EEPROM has two blocks
 of 1024 bytes and its contents is not loaded to FlexRAM during reset:
 @example
 kinetis nvm_partition eebkp 16 1024 1024 off
+@end example
+
+S32K1xx devices have a single EEPROM block, so specify the total EEPROM size
+only. Use @command{kinetis mdm mass_erase} to clear an existing partition. Set
+32 KB EEPROM backup (no data flash) with 2 KB EEPROM, loaded to FlexRAM during
+reset:
+@example
+kinetis nvm_partition eebkp 32 2048
+@end example
+
+Same with space for 20 CSEc keys. Once keys are allocated, mass erase
+is blocked until the CSEc debug authentication (CMD_DBG_CHAL, CMD_DBG_AUTH)
+has removed them. The authentication is derived from the MASTER_ECU_KEY,
+so load a MASTER_ECU_KEY to be able to erase the device again:
+@example
+kinetis nvm_partition eebkp 32 1024 1024 on 20
 @end example
 @end deffn
 
@@ -8069,6 +8176,19 @@ code.
 
 @end deffn
 
+@deffn {Flash Driver} {nrf54}
+This driver supports the nRF54 microcontroller family from Nordic Semiconductor.
+These devices use a resistive random access memory (RRAM) and no flash memory technology.
+This technology requires no special erase operation, data can be arbitrarily manipulated.
+
+The UICR memory region is currently not supported by the driver.
+
+@example
+flash bank $_FLASHNAME nrf54 0 0x00000000 0 0 $_TARGETNAME
+@end example
+
+@end deffn
+
 @deffn {Flash Driver} {ocl}
 This driver is an implementation of the ``on chip flash loader''
 protocol proposed by Pavel Chromy.
@@ -8487,6 +8607,52 @@ if more than one Stellaris chip is connected, the procedure is
 applied to all of them.
 @end quotation
 @end deffn
+@end deffn
+
+@deffn {Flash Driver} {stldr}
+This driver supports STM32CubeProgrammer Memory Loaders (aka STLDR).
+This driver permits re-using these loaders to support both internal and external memories.
+
+@example
+flash bank $_FLASHNAME stldr 0 0 0 0 $_TARGETNAME /path/to/loader.xldr
+@end example
+
+The predefined @var{chip_width} parameter of the @code{flash bank}
+command specifies the required flash write alignment, in bytes.
+The driver uses this value for both the start address and the length
+of flash writes. If @var{chip_width} is zero, the driver defaults to
+a 32-byte alignment.
+
+This driver provides these specific commands:
+
+@deffn {Command} {stldr set_loader} num path_to_loader
+Sets the loader path
+
+The @var{num} parameter is a value shown by @command{flash banks}.
+
+Hint: use a complete path name for @var{path_to_loader}, so you don't depend
+on the directory used to start the OpenOCD server.
+@end deffn
+
+@deffn {Command} {stldr set_size} num size
+Set bank size
+
+The @var{num} parameter is a value shown by @command{flash banks}.
+The @var{size} is the bank size.
+@end deffn
+
+@deffn {Command} {stldr init} num
+Initialize memory
+
+The @var{num} parameter is a value shown by @command{flash banks}.
+@end deffn
+
+@deffn {Command} {stldr mass_erase} num
+Mass erases the entire flash bank.
+
+The @var{num} parameter is a value shown by @command{flash banks}.
+@end deffn
+
 @end deffn
 
 @deffn {Flash Driver} {stm32f1x}
@@ -9122,7 +9288,7 @@ NAND chips must be declared in configuration scripts,
 plus some additional configuration that's done after
 OpenOCD has initialized.
 
-@deffn {Config Command} {nand device} name driver target [configparams...]
+@deffn {Config Command} {nand device} bank_name driver target [configparams...]
 Declares a NAND device, which can be read and written to
 after it has been configured through @command{nand probe}.
 In OpenOCD, devices are single chips; this is unlike some
@@ -9136,8 +9302,8 @@ initialization has completed. Use it in board specific
 configuration files, not interactively.
 
 @itemize @bullet
-@item @var{name} ... may be used to reference the NAND bank
-in most other NAND commands. A number is also available.
+@item @var{bank_name} ... may be used to reference the NAND bank
+in most other NAND commands.
 @item @var{driver} ... identifies the NAND controller driver
 associated with the NAND device being declared.
 @xref{nanddriverlist,,NAND Driver List}.
@@ -9164,21 +9330,22 @@ Note that un-probed devices show no details.
 @end example
 @end deffn
 
-@deffn {Command} {nand probe} num
+@deffn {Command} {nand probe} (bank_name|num)
 Probes the specified device to determine key characteristics
 like its page and block sizes, and how many blocks it has.
-The @var{num} parameter is the value shown by @command{nand list}.
 You must (successfully) probe a device before you can use
 it with most other NAND commands.
+Specify the bank by the full @var{bank_name}.
+Alternatively use the @var{num} parameter.
+@xref{flashbanknamenum,,Specifying NOR and NAND Flash Banks}.
 @end deffn
 
 @subsection Erasing, Reading, Writing to NAND Flash
 
-@deffn {Command} {nand dump} num filename offset length [oob_option]
+@deffn {Command} {nand dump} (bank_name|num) filename offset length [oob_option]
 @cindex NAND reading
 Reads binary data from the NAND device and writes it to the file,
 starting at the specified offset.
-The @var{num} parameter is the value shown by @command{nand list}.
 
 Use a complete path name for @var{filename}, so you don't depend
 on the directory used to start the OpenOCD server.
@@ -9211,7 +9378,7 @@ spare areas associated with each data page.
 @end itemize
 @end deffn
 
-@deffn {Command} {nand erase} num [offset length]
+@deffn {Command} {nand erase} (bank_name|num) [offset length]
 @cindex NAND erasing
 @cindex NAND programming
 Erases blocks on the specified NAND device, starting at the
@@ -9220,7 +9387,6 @@ Both of those values must be exact multiples of the device's
 block size, and the region they specify must fit entirely in the chip.
 If those parameters are not specified,
 the whole NAND chip will be erased.
-The @var{num} parameter is the value shown by @command{nand list}.
 
 @b{NOTE:} This command will try to erase bad blocks, when told
 to do so, which will probably invalidate the manufacturer's bad
@@ -9229,13 +9395,12 @@ For the remainder of the current server session, @command{nand info}
 will still report that the block ``is'' bad.
 @end deffn
 
-@deffn {Command} {nand write} num filename offset [option...]
+@deffn {Command} {nand write} (bank_name|num) filename offset [option...]
 @cindex NAND writing
 @cindex NAND programming
 Writes binary data from the file into the specified NAND device,
 starting at the specified offset. Those pages should already
 have been erased; you can't change zero bits to one bits.
-The @var{num} parameter is the value shown by @command{nand list}.
 
 Use a complete path name for @var{filename}, so you don't depend
 on the directory used to start the OpenOCD server.
@@ -9288,12 +9453,11 @@ the underlying driver from applying hardware ECC.
 @end itemize
 @end deffn
 
-@deffn {Command} {nand verify} num filename offset [option...]
+@deffn {Command} {nand verify} (bank_name|num) filename offset [option...]
 @cindex NAND verification
 @cindex NAND programming
 Verify the binary data in the file has been programmed to the
 specified NAND device, starting at the specified offset.
-The @var{num} parameter is the value shown by @command{nand list}.
 
 Use a complete path name for @var{filename}, so you don't depend
 on the directory used to start the OpenOCD server.
@@ -9317,30 +9481,27 @@ be removed in a future release.
 @subsection Other NAND commands
 @cindex NAND other commands
 
-@deffn {Command} {nand check_bad_blocks} num [offset length]
+@deffn {Command} {nand check_bad_blocks} (bank_name|num) [offset length]
 Checks for manufacturer bad block markers on the specified NAND
 device. If no parameters are provided, checks the whole
 device; otherwise, starts at the specified @var{offset} and
 continues for @var{length} bytes.
 Both of those values must be exact multiples of the device's
 block size, and the region they specify must fit entirely in the chip.
-The @var{num} parameter is the value shown by @command{nand list}.
 
 @b{NOTE:} Before using this command you should force raw access
 with @command{nand raw_access enable} to ensure that the underlying
 driver will not try to apply hardware ECC.
 @end deffn
 
-@deffn {Command} {nand info} num
-The @var{num} parameter is the value shown by @command{nand list}.
+@deffn {Command} {nand info} (bank_name|num)
 This prints the one-line summary from "nand list", plus for
 devices which have been probed this also prints any known
 status for each block.
 @end deffn
 
-@deffn {Command} {nand raw_access} num (@option{enable}|@option{disable})
+@deffn {Command} {nand raw_access} (bank_name|num) (@option{enable}|@option{disable})
 Sets or clears an flag affecting how page I/O is done.
-The @var{num} parameter is the value shown by @command{nand list}.
 
 This flag is cleared (disabled) by default, but changing that
 value won't affect all NAND devices. The key factor is whether
@@ -9569,8 +9730,8 @@ loading the bitstream. While required for Series2, Series3, and Series6, it
 breaks bitstream loading on Series7.
 
 @example
-openocd -f board/digilent_zedboard.cfg -c "init" \
-	-c "pld load 0 zedboard_bitstream.bit"
+openocd -f board/digilent/zedboard.cfg -c "init" \
+	-c "pld load zynq_pl.pld zedboard_bitstream.bit"
 @end example
 
 
@@ -11953,6 +12114,25 @@ configure the @code{cetrig} in the dcsr register. Defaults to @option{on}.
 @end itemize
 @end itemize
 
+@itemize
+@item @code{-detect-misa} @option{off}|@option{on} -- determines whether OpenOCD
+should detect all supported misa extensions. Defaults to @option{on}.
+
+@itemize
+@item @code{cget} returns the currently configured state for @code{-detect-misa}.
+@end itemize
+@end itemize
+
+@itemize
+@item @code{-sba-flush-cache} @option{off}|@option{on} -- determines whether
+OpenOCD will automatically execute RISC-V CMO instructions (@var{cbo.flush})
+when write memory via RISC-V Debug System Bus interface. Defaults to @option{off}.
+
+@itemize
+@item @code{cget} returns the currently configured state for @code{-sba-flush-cache}.
+@end itemize
+@end itemize
+
 @subsection RISC-V Debug Configuration Commands
 
 @deffn {Command} {riscv dump_sample_buf} [base64]
@@ -12041,6 +12221,8 @@ dump_sample_buf}.
 Quickly read count words of the given size from address. This can be useful
 to read out a buffer that's memory-mapped to be accessed through a single
 address, or to sample a changing value in a memory-mapped device.
+
+The address is physical.
 @end deffn
 
 @deffn {Command} {riscv info}
@@ -12060,9 +12242,11 @@ Set the wall-clock timeout (in seconds) for individual commands. The default
 should work fine for all but the slowest targets (eg. simulators).
 @end deffn
 
-@deffn {Command} {riscv set_mem_access} method1 [method2] [method3]
+@deffn {Command} {riscv mem_access} [method1 [method2 [method3]]]
 Specify which RISC-V memory access method(s) shall be used, and in which order
 of priority. At least one method must be specified.
+
+With no parameter, this command displays the configured memory access method(s).
 
 Available methods are:
 @itemize
@@ -12088,6 +12272,7 @@ read the respective entries). This is the default mode.
 (Virtual memory access will fail with an error if the hardware doesn't
 support the necessary functionality.)
 @item @option{off} - Virtual addresses are not translated (identity mapping is assumed).
+An access in this mode behaves exactly like an explicitly physical one.
 @end itemize
 Returns current translation mode if called without arguments.
 @end deffn
@@ -13209,6 +13394,18 @@ If your device/vendor is not supported you have to use the first variant.
 
 @end deffn
 
+@deffn {Command} {ipdbg names}
+List the known IPDBG hubs with their name.
+@end deffn
+
+
+@deffn {Command} {ipdbg services}
+List the active services, as a Tcl list of dicts with keys
+@option{hub}, @option{port}, @option{tool} and @option{state}
+(@option{listening} or @option{connected}).
+@end deffn
+
+
 @deffn {Command} {$hub_name start} @option{-tool @var{number}} @option{-port @var{number}}
 Starts a IPDBG JTAG-Host server. The remaining arguments can be specified in any order.
 
@@ -13259,10 +13456,15 @@ The maximum possible queue size is 1024 which is also the default.
 @end deffn
 
 @example
-bitbang.ibdbghub queuing -size 32
+bitbang.ipdbghub queuing -size 32
 @end example
 Send a maximum of 32 transfers to the queue before executing them.
 
+@deffn {Command} {$hub_name services}
+List the active services, as a Tcl list of dicts with keys
+@option{port}, @option{tool} and @option{state}
+(@option{listening} or @option{connected}).
+@end deffn
 
 @node Utility Commands
 @chapter Utility Commands
@@ -13716,7 +13918,7 @@ By "low-level", we mean commands that a human would typically not
 invoke directly.
 
 @itemize
-@item @b{flash banks} <@var{driver}> <@var{base}> <@var{size}> <@var{chip_width}> <@var{bus_width}> <@var{target}> [@option{driver options} ...]
+@item @b{flash banks}
 
 Return information about the flash banks
 

@@ -55,6 +55,7 @@ NOR_DRIVERS = \
 	%D%/non_cfi.c \
 	%D%/npcx.c \
 	%D%/nrf5.c \
+	%D%/nrf54.c \
 	%D%/numicro.c \
 	%D%/ocl.c \
 	%D%/pac55xx.c \
@@ -74,6 +75,7 @@ NOR_DRIVERS = \
 	%D%/stmsmi.c \
 	%D%/stmqspi.c \
 	%D%/stellaris.c \
+	%D%/stldr.c \
 	%D%/stm32f1x.c \
 	%D%/stm32f2x.c \
 	%D%/stm32lx.c \
